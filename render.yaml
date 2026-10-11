@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: be-water-multiplayer
+    runtime: node
+    plan: free
+    # Closest Render region to Europe / Middle East
+    region: frankfurt
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_VERSION
+        value: "20"
