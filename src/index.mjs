@@ -9,6 +9,7 @@
 import { defineServer, defineRoom } from 'colyseus';
 import { WebSocketTransport } from '@colyseus/ws-transport';
 import { ModelRoom } from './ModelRoom.mjs';
+import { registerConvertRoute } from './convert.mjs';
 
 
 const PORT = Number(process.env.PORT) || 2567;
@@ -51,6 +52,9 @@ const server = defineServer({
         app.get('/health', (req, res) => {
             res.send('ok');
         });
+
+        // POST /convert : FBX -> GLB (see convert.mjs)
+        registerConvertRoute(app);
     }
 });
 
