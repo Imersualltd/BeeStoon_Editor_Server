@@ -21,8 +21,8 @@ import { Room } from 'colyseus';
 
 
 // Keep in sync with MAX_FILE_SIZE in the client
-// (2 MB file -> ~2.8 MB base64 data URL).
-const MAX_DATA_URL_LENGTH = 3 * 1024 * 1024;
+// (10 MB file -> ~13.4 MB base64 data URL).
+const MAX_DATA_URL_LENGTH = 14 * 1024 * 1024;
 
 // Seconds a dropped player keeps their seat
 const RECONNECT_WINDOW = 20;

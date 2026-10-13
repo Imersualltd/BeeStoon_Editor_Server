@@ -29,8 +29,9 @@ const server = defineServer({
 
     transport: new WebSocketTransport({
         // Colyseus default is only 4 KB per message.
-        // A 2 MB GLB is ~2.8 MB as base64.
-        maxPayload: 4 * 1024 * 1024,
+        // A 10 MB GLB is ~13.4 MB as base64, plus a
+        // little message overhead.
+        maxPayload: 16 * 1024 * 1024,
 
         // Keep-alive ping so cloud proxies do not
         // close idle connections.
