@@ -14,6 +14,7 @@
     "colyseus": "^0.18.9",
     "@colyseus/ws-transport": "^0.18.4",
     "express": "^4.21.2",
-    "fbx2gltf": "0.9.7-p1"
+    "fbx2gltf": "0.9.7-p1",
+    "fflate": "0.8.2"
   }
 }

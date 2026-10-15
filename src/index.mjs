@@ -10,6 +10,7 @@ import { defineServer, defineRoom } from 'colyseus';
 import { WebSocketTransport } from '@colyseus/ws-transport';
 import { ModelRoom } from './ModelRoom.mjs';
 import { registerConvertRoute } from './convert.mjs';
+import { registerExportFbxRoute } from './export-fbx.mjs';
 
 
 const PORT = Number(process.env.PORT) || 2567;
@@ -56,6 +57,9 @@ const server = defineServer({
 
         // POST /convert : FBX -> GLB (see convert.mjs)
         registerConvertRoute(app);
+
+        // POST /export/fbx : GLB -> FBX (see export-fbx.mjs)
+        registerExportFbxRoute(app);
     }
 });
 
