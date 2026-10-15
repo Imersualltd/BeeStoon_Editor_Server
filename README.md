@@ -17,10 +17,9 @@ npm start
 هر سرویسی که Node.js 20 و WebSocket را پشتیبانی کند جواب می‌دهد.
 پورت را سرویس از طریق متغیر `PORT` می‌دهد و کد خودش آن را می‌خواند.
 
-- Build command: `npm install`
-- Start command: `npm start`
+- روی Render سرویس به‌صورت **Docker** اجرا می‌شود (`render.yaml` و `Dockerfile`)،
+  چون خروجی FBX به ابزار `assimp` نیاز دارد که در Docker image نصب می‌شود.
 - Health check: `/health`
-- یا از `Dockerfile` استفاده کنید.
 
 بعد از استقرار، آدرس HTTPS سرویس (مثلاً `https://be-water.onrender.com`)
 را در attribute **Server Url** روی entity `NetworkManager` بگذارید.
@@ -49,3 +48,11 @@ npm start
 
 این پروتکل جایگزین پیام‌های قدیمی `asset` و `transform` شده؛ سرور و
 `network-manager.mjs` باید با هم به‌روز شوند.
+
+## خروجی FBX
+
+`POST /export/fbx?name=<نام فایل>` با بدنهٔ GLB.
+پاسخ: اگر مدل تکسچر داشته باشد یک فایل ZIP (فایل FBX + تصاویر تکسچر کنار آن)،
+وگرنه خود فایل FBX. تبدیل با `assimp` انجام می‌شود (بستهٔ `assimp-utils` در Dockerfile).
+تکسچرها جدا گذاشته می‌شوند چون FBX با تکسچر توکار از assimp در Blender درست باز نمی‌شود.
+
