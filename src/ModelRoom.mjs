@@ -30,6 +30,8 @@
  *     'object:release'    { id }
  *     'sync-request'      { have?: [id, ...] }
  *     'session:leave'     { choice?: 'close'|'keep'|'assign', newAdminId? }
+ *                         (an admin alone in the session always
+ *                         closes it, whatever the choice)
  *
  *   client -> server (admins only)
  *     'join:approve'      { userId, role }
@@ -832,7 +834,14 @@ export class ModelRoom extends Room {
                 this.onlineUsers('admin').length <= 1;
 
 
-            if (lastAdmin && choice === 'close') {
+            // The admin is the only one here: leaving ends
+            // the session (and its link) whatever the choice
+            const alone =
+                user.role === 'admin' &&
+                this.onlineUsers().length <= 1;
+
+
+            if ((lastAdmin && choice === 'close') || alone) {
 
                 this.closeSession(user);
 

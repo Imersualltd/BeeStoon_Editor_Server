@@ -395,7 +395,16 @@ async function main() {
     await sleep(500);
     const again = await connect('Zed', KEY2, 'create');
     check('session ends when everyone left (key is free again)', () => assert.equal(again.state.you.role, 'admin'));
-    await again.room.leave();
+
+
+    console.log('\nAdmin alone leaves -> session closed');
+
+    again.send('session:leave', { choice: 'keep' });
+    await waitFor(() => again.leftCode !== null, 'zed left');
+    check('admin alone leaving closes the session (4103)', () => assert.equal(again.leftCode, 4103));
+    await sleep(300);
+    const reopen = await connect('Zed', KEY2, 'create').then(() => null, (e) => e);
+    check('its link no longer works (410)', () => assert.equal(reopen?.code, 410));
 
 
     console.log(`\nAll ${passed} checks passed`);
