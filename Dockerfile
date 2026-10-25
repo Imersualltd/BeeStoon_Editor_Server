@@ -1,7 +1,7 @@
 # Debian (glibc) base: the FBX2glTF binary used by /convert
 # needs glibc, and assimp-utils (used by /export/fbx) comes
 # from Debian packages.
-FROM node:20-bookworm-slim
+FROM node:22-bookworm-slim
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends assimp-utils \

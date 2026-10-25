@@ -40,6 +40,8 @@ import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
+import { requireEditor } from './sessions.mjs';
+
 
 // Keep in sync with MAX_FBX_EXPORT_SIZE in model-converter.mjs
 const MAX_UPLOAD_BYTES = 50 * 1024 * 1024;
@@ -71,7 +73,7 @@ export function registerExportFbxRoute(app) {
         res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
         res.setHeader(
             'Access-Control-Allow-Headers',
-            'Content-Type, ngrok-skip-browser-warning'
+            'Content-Type, Authorization, ngrok-skip-browser-warning'
         );
 
         if (req.method === 'OPTIONS') {
@@ -83,8 +85,11 @@ export function registerExportFbxRoute(app) {
     });
 
 
+    // Only admins and editors of a live session
+    // (Authorization: Bearer <session ticket>)
     app.post(
         '/export/fbx',
+        requireEditor,
         express.raw({ type: '*/*', limit: MAX_UPLOAD_BYTES }),
         handleExport
     );

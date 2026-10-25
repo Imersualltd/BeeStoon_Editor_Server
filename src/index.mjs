@@ -1,7 +1,7 @@
 /*
  * BE WATER - multiplayer server entry point
  * --------------------------------------------------
- * Runs anywhere Node 20+ runs (Render, Railway,
+ * Runs anywhere Node 22+ runs (Render, Railway,
  * Liara, a VPS ...). The host decides the port
  * through the PORT environment variable.
  */
@@ -9,6 +9,7 @@
 import { defineServer, defineRoom } from 'colyseus';
 import { WebSocketTransport } from '@colyseus/ws-transport';
 import { ModelRoom } from './ModelRoom.mjs';
+import { getAuthAdapter } from './auth/index.mjs';
 import { registerConvertRoute } from './convert.mjs';
 import { registerExportFbxRoute } from './export-fbx.mjs';
 
@@ -20,12 +21,20 @@ const PORT = Number(process.env.PORT) || 2567;
 const HOST = process.env.HOST || '0.0.0.0';
 
 
+// Check the identity settings now, so a wrong
+// AUTH_PROVIDER stops the server at start-up.
+getAuthAdapter();
+
+
 const server = defineServer({
 
     rooms: {
-        // Must match "Room Name" on the PlayCanvas
-        // NetworkManager entity.
-        my_room: defineRoom(ModelRoom)
+        // One room per share link. The host calls
+        // create('session', { sessionKey }) with a new
+        // random key; people opening the link call
+        // join('session', { sessionKey }) and land in
+        // that same room.
+        session: defineRoom(ModelRoom).filterBy(['sessionKey'])
     },
 
     transport: new WebSocketTransport({
