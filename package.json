@@ -5,16 +5,21 @@
   "type": "module",
   "main": "src/index.mjs",
   "scripts": {
-    "start": "node src/index.mjs"
+    "start": "node src/index.mjs",
+    "test": "node test/roles.test.mjs"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   },
   "dependencies": {
-    "colyseus": "^0.18.9",
     "@colyseus/ws-transport": "^0.18.4",
+    "colyseus": "^0.18.9",
     "express": "^4.21.2",
     "fbx2gltf": "0.9.7-p1",
-    "fflate": "0.8.2"
+    "fflate": "0.8.2",
+    "jsonwebtoken": "^9.0.3"
+  },
+  "devDependencies": {
+    "@colyseus/sdk": "^0.18.5"
   }
 }

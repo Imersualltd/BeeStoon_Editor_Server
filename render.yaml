@@ -9,3 +9,11 @@ services:
     # Closest Render region to Europe / Middle East
     region: frankfurt
     healthCheckPath: /health
+    envVars:
+      # Development: trust the name the client sends.
+      # Switch to AUTH_PROVIDER=jwt (+ JWT_SECRET or
+      # JWT_PUBLIC_KEY) for the BeeStoon build.
+      - key: AUTH_PROVIDER
+        value: dev
+      - key: ALLOW_DEV_AUTH
+        value: "true"

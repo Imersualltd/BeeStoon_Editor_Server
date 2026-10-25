@@ -24,6 +24,8 @@ import { createRequire } from 'node:module';
 import { tmpdir, type as osType } from 'node:os';
 import path from 'node:path';
 
+import { requireEditor } from './sessions.mjs';
+
 
 // Must match MAX_UPLOAD_SIZE in model-converter.mjs
 const MAX_UPLOAD_BYTES = 50 * 1024 * 1024;
@@ -53,7 +55,7 @@ export function registerConvertRoute(app) {
         res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
         res.setHeader(
             'Access-Control-Allow-Headers',
-            'Content-Type, ngrok-skip-browser-warning'
+            'Content-Type, Authorization, ngrok-skip-browser-warning'
         );
 
         if (req.method === 'OPTIONS') {
@@ -65,8 +67,11 @@ export function registerConvertRoute(app) {
     });
 
 
+    // Only admins and editors of a live session
+    // (Authorization: Bearer <session ticket>)
     app.post(
         '/convert',
+        requireEditor,
         express.raw({ type: '*/*', limit: MAX_UPLOAD_BYTES }),
         handleConvert
     );
