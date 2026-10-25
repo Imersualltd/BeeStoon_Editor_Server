@@ -20,6 +20,8 @@
 
 import { randomBytes } from 'node:crypto';
 
+import { ServerError } from 'colyseus';
+
 
 export const SESSION_KEY_PATTERN = /^[A-Za-z0-9_-]{8,64}$/;
 
@@ -30,11 +32,23 @@ const rooms = new Map();
 // ticket -> { room, userId }
 const tickets = new Map();
 
+// sessionKey -> time it was closed by an admin. A
+// closed link must not come back to life when someone
+// reloads it (the client re-creates a room with the
+// same key after a server restart).
+const closedKeys = new Map();
+
+const CLOSED_KEY_MS = 24 * 60 * 60 * 1000;
+
 
 export function registerSession(sessionKey, room) {
 
     if (rooms.has(sessionKey)) {
-        throw new Error('This session already exists');
+        throw new ServerError(409, 'This session already exists');
+    }
+
+    if (isClosed(sessionKey)) {
+        throw new ServerError(410, 'This session has been closed');
     }
 
     rooms.set(sessionKey, room);
@@ -52,6 +66,27 @@ export function unregisterSession(sessionKey, room) {
             tickets.delete(ticket);
         }
     }
+}
+
+
+export function markClosed(sessionKey) {
+
+    closedKeys.set(sessionKey, Date.now());
+
+    // Forget old entries
+    for (const [key, time] of closedKeys) {
+        if (Date.now() - time > CLOSED_KEY_MS) {
+            closedKeys.delete(key);
+        }
+    }
+}
+
+
+function isClosed(sessionKey) {
+
+    const time = closedKeys.get(sessionKey);
+
+    return time !== undefined && Date.now() - time <= CLOSED_KEY_MS;
 }
 
 

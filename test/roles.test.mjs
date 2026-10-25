@@ -168,11 +168,12 @@ async function main() {
         assert.ok(admin.state.you.ticket);
     });
 
-    await rejects(connect('Mallory', KEY, 'create'), 'second create with same key');
-    check('a used session key cannot be created again', () => {});
+    const dup = await connect('Mallory', KEY, 'create').then(() => null, (e) => e);
+    check('a used session key cannot be created again (409)', () => assert.equal(dup?.code, 409));
 
-    await rejects(connect('Bob', 'no-such-session-xx'), 'join unknown key');
-    check('joining an unknown link fails', () => {});
+    const missing = await connect('Bob', 'no-such-session-xx').then(() => null, (e) => e);
+    check('joining an unknown link fails', () => assert.ok(missing));
+    console.log(`      (unknown link error: code ${missing.code}, "${missing.message}")`);
 
 
     admin.send('object:add', { id: 'chair', name: 'chair.glb', dataUrl: TINY_GLB, transform: POSE(0) });
@@ -372,7 +373,11 @@ async function main() {
 
     await sleep(300);
     await rejects(connect('Eve', KEY), 'join closed session');
-    check('closed session link no longer works', () => {});
+    const recreate = await connect('Eve', KEY, 'create').then(() => null, (e) => e);
+    check('closed session link no longer works, not even re-created (410)', () => {
+        assert.ok(recreate, 're-create must fail');
+        assert.equal(recreate.code, 410);
+    });
 
 
     console.log('\nLast admin hands over and leaves ("assign")');

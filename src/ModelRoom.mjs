@@ -76,6 +76,7 @@ import { Room, ServerError } from 'colyseus';
 import { getAuthAdapter } from './auth/index.mjs';
 import {
     issueTicket,
+    markClosed,
     registerSession,
     revokeTickets,
     SESSION_KEY_PATTERN,
@@ -869,6 +870,8 @@ export class ModelRoom extends Room {
         }
 
         this.closed = true;
+
+        markClosed(this.sessionKey);
 
         console.log(`[${this.roomId}] session closed by ${byUser.name}`);
 
