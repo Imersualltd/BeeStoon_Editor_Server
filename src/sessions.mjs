@@ -43,12 +43,14 @@ const CLOSED_KEY_MS = 24 * 60 * 60 * 1000;
 
 export function registerSession(sessionKey, room) {
 
-    if (rooms.has(sessionKey)) {
-        throw new ServerError(409, 'This session already exists');
-    }
-
+    // Closed first: a just-closed room may not be
+    // disposed yet
     if (isClosed(sessionKey)) {
         throw new ServerError(410, 'This session has been closed');
+    }
+
+    if (rooms.has(sessionKey)) {
+        throw new ServerError(409, 'This session already exists');
     }
 
     rooms.set(sessionKey, room);
