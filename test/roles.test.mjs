@@ -140,7 +140,8 @@ const server = spawn(process.execPath, ['src/index.mjs'], {
         PORT: String(PORT),
         AUTH_PROVIDER: 'dev',
         ALLOW_DEV_AUTH: 'true',
-        ADMIN_GRACE_SECONDS: '2'
+        ADMIN_GRACE_SECONDS: '2',
+        RECONNECT_WINDOW: '1'
     },
     stdio: ['ignore', 'pipe', 'pipe']
 });
@@ -346,14 +347,16 @@ async function main() {
     check('same user in a new tab replaces the old one (4104)', () => assert.equal(eve2.leftCode, 4104));
 
 
-    console.log('\nLast admin leaves ("keep") -> auto-promotion');
+    console.log('\nAn admin leaves while another admin is online');
 
+    admin.send('role:set', { userId: 'dev:bob', role: 'admin' });
+    await waitFor(() => bob.state.you.role === 'admin', 'bob admin');
     admin.send('session:leave', { choice: 'keep' });
     await waitFor(() => admin.leftCode !== null, 'admin left');
-    await waitFor(() => bob.state.you.role === 'admin', 'bob promoted', 15000);
-    check('oldest online editor (Bob) becomes admin after the grace time', () => {
-        assert.equal(eve3.state.you.role, 'editor');
-        assert.ok(bob.got('session:notice'));
+    await sleep(300);
+    check('the session goes on (Ada just left)', () => {
+        assert.notEqual(admin.leftCode, 4103);
+        assert.equal(eve3.leftCode, null);
     });
 
     const ada2 = await connect('Ada', KEY);
@@ -361,12 +364,12 @@ async function main() {
     await ada2.room.leave();
 
 
-    console.log('\nLast admin closes the session');
+    console.log('\nLast admin leaves -> session closed for everyone');
 
     await waitFor(() => !userIn(bob, 'Ada')?.online, 'ada offline');
-    bob.send('session:leave', { choice: 'close' });
+    bob.send('session:leave', { choice: 'keep' });
     await waitFor(() => eve3.leftCode !== null && bob.leftCode !== null, 'everyone disconnected');
-    check('close disconnects everyone with 4103', () => {
+    check('last admin leaving disconnects everyone with 4103', () => {
         assert.equal(eve3.leftCode, 4103);
         assert.ok(eve3.got('session:closed'));
     });
@@ -391,10 +394,23 @@ async function main() {
     await waitFor(() => x.state.you.role === 'admin', 'xavi admin');
     check('assign makes the chosen person admin', () => {});
 
-    await x.room.leave();
-    await sleep(500);
-    const again = await connect('Zed', KEY2, 'create');
-    check('session ends when everyone left (key is free again)', () => assert.equal(again.state.you.role, 'admin'));
+    check('the session goes on after a hand-over', () => assert.equal(x.leftCode, null));
+
+
+    console.log('\nLast admin closes the tab and does not come back');
+
+    const y = await connect('Yan', KEY2);
+    x.send('join:approve', { userId: 'dev:yan', role: 'editor' });
+    await waitFor(() => y.state.you.status === 'approved', 'yan approved');
+    await x.room.leave(false);   // like closing the tab
+    await waitFor(() => y.leftCode !== null, 'yan disconnected', 10000);
+    check('session closes once the reconnect window runs out (4103)', () => assert.equal(y.leftCode, 4103));
+    await sleep(300);
+    const reopen2 = await connect('Xavi', KEY2, 'create').then(() => null, (e) => e);
+    check('its link no longer works (410)', () => assert.equal(reopen2?.code, 410));
+
+    const KEY3 = 'test-session-0003';
+    const again = await connect('Zed', KEY3, 'create');
 
 
     console.log('\nAdmin alone leaves -> session closed');
@@ -403,7 +419,7 @@ async function main() {
     await waitFor(() => again.leftCode !== null, 'zed left');
     check('admin alone leaving closes the session (4103)', () => assert.equal(again.leftCode, 4103));
     await sleep(300);
-    const reopen = await connect('Zed', KEY2, 'create').then(() => null, (e) => e);
+    const reopen = await connect('Zed', KEY3, 'create').then(() => null, (e) => e);
     check('its link no longer works (410)', () => assert.equal(reopen?.code, 410));
 
 

@@ -30,8 +30,11 @@
  *     'object:release'    { id }
  *     'sync-request'      { have?: [id, ...] }
  *     'session:leave'     { choice?: 'close'|'keep'|'assign', newAdminId? }
- *                         (an admin alone in the session always
- *                         closes it, whatever the choice)
+ *                         (the last online admin leaving closes
+ *                         the session unless they 'assign' admin
+ *                         to someone first; so does that admin
+ *                         closing the tab and not coming back
+ *                         within RECONNECT_WINDOW)
  *
  *   client -> server (admins only)
  *     'join:approve'      { userId, role }
@@ -96,7 +99,8 @@ const MAX_ROOM_BYTES =
     (Number(process.env.MAX_ROOM_MB) || 250) * 1024 * 1024;
 
 // Seconds a dropped player keeps their seat
-const RECONNECT_WINDOW = 20;
+const RECONNECT_WINDOW =
+    Number(process.env.RECONNECT_WINDOW) || 20;
 
 // Seconds without any online admin before someone
 // is promoted automatically
@@ -354,6 +358,16 @@ export class ModelRoom extends Room {
             `[${this.roomId}] leave "${user.name}" ` +
             `(${this.clients.length} online)`
         );
+
+
+        // The last admin is gone for good (tab closed,
+        // not back in time): the session ends with them
+        if (user.role === 'admin' && user.status === 'approved' && this.onlineUsers('admin').length === 0) {
+
+            this.closeSession(user);
+
+            return;
+        }
 
 
         this.sendState();
@@ -818,11 +832,9 @@ export class ModelRoom extends Room {
 
         /*
          * Leave button. Only matters for the last
-         * online admin, who picks:
-         *   close  - end the session for everyone
-         *   keep   - just leave; someone is promoted
-         *            automatically after the grace time
+         * online admin:
          *   assign - make newAdminId admin, then leave
+         *   anything else - the session ends for everyone
          * Everyone else simply leaves.
          */
         this.onApproved('session:leave', (client, user, data) => {
@@ -834,14 +846,9 @@ export class ModelRoom extends Room {
                 this.onlineUsers('admin').length <= 1;
 
 
-            // The admin is the only one here: leaving ends
-            // the session (and its link) whatever the choice
-            const alone =
-                user.role === 'admin' &&
-                this.onlineUsers().length <= 1;
-
-
-            if ((lastAdmin && choice === 'close') || alone) {
+            // The last admin leaving ends the session (and
+            // its link), unless they hand admin over first
+            if (lastAdmin && choice !== 'assign') {
 
                 this.closeSession(user);
 
