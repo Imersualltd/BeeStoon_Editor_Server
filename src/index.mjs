@@ -12,6 +12,7 @@ import { ModelRoom } from './ModelRoom.mjs';
 import { getAuthAdapter } from './auth/index.mjs';
 import { registerConvertRoute } from './convert.mjs';
 import { registerExportFbxRoute } from './export-fbx.mjs';
+import { registerArShareRoutes } from './ar-share.mjs';
 
 
 const PORT = Number(process.env.PORT) || 2567;
@@ -69,6 +70,9 @@ const server = defineServer({
 
         // POST /export/fbx : GLB -> FBX (see export-fbx.mjs)
         registerExportFbxRoute(app);
+
+        // POST /ar/snapshots, GET /ar/<id> : AR share links (see ar-share.mjs)
+        registerArShareRoutes(app);
     }
 });
 

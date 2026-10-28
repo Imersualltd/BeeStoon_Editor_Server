@@ -6,12 +6,13 @@
   "main": "src/index.mjs",
   "scripts": {
     "start": "node src/index.mjs",
-    "test": "node test/roles.test.mjs"
+    "test": "node test/roles.test.mjs && node test/ar-share.test.mjs"
   },
   "engines": {
     "node": ">=22"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.1159.0",
     "@colyseus/ws-transport": "^0.18.4",
     "colyseus": "^0.18.9",
     "express": "^4.21.2",

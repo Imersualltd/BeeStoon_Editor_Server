@@ -125,3 +125,24 @@ admin پیام `invite:email` را با `{ emails, role, link }` می‌فرست
 وگرنه خود فایل FBX. تبدیل با `assimp` انجام می‌شود (بستهٔ `assimp-utils` در Dockerfile).
 تکسچرها جدا گذاشته می‌شوند چون FBX با تکسچر توکار از assimp در Blender درست باز نمی‌شود.
 
+
+## لینک AR (نمایش در اندازهٔ واقعی روی هر گوشی)
+
+دکمهٔ AR در ادیتور می‌پرسد «Selected» یا «All scene»، از آن یک GLB می‌سازد و به
+`POST /ar/snapshots?name=<نام>` می‌فرستد (`Authorization: Bearer <ticket>`؛ هر عضو تأییدشدهٔ جلسه،
+viewer هم). پاسخ: `{ id, url, expiresAt }`.
+
+- `GET /ar/<id>` صفحهٔ نمایش (بدون ورود): با `<model-viewer>` گوگل؛ اندروید Scene Viewer / WebXR،
+  آیفون AR Quick Look (فایل USDZ روی خود گوشی از GLB ساخته می‌شود). `ar-scale="fixed"` یعنی اندازهٔ واقعی
+  (۱ واحد PlayCanvas = ۱ متر).
+- `GET /ar/<id>/model.glb` خود مدل.
+- هر بار زدن دکمه یک لینک تازه می‌سازد. لینک بعد از `AR_LINK_HOURS` ساعت (پیش‌فرض ۲۴) منقضی و پاک می‌شود.
+
+| متغیر | توضیح |
+|---|---|
+| `AR_STORAGE=local` | پیش‌فرض. فایل‌ها در پوشهٔ `AR_LOCAL_DIR` (پیش‌فرض پوشهٔ temp). روی Render با هر deploy پاک می‌شود. |
+| `AR_STORAGE=s3` | هر فضای سازگار با S3، مثلاً DigitalOcean Spaces: `S3_ENDPOINT` (مثلاً `https://fra1.digitaloceanspaces.com`)، `S3_REGION` (مثلاً `fra1`)، `S3_BUCKET`، `S3_ACCESS_KEY_ID`، `S3_SECRET_ACCESS_KEY`، اختیاری `S3_PREFIX` (پیش‌فرض `ar-snapshots/`). باکت خصوصی می‌ماند؛ سرور فایل را به گوشی می‌فرستد. |
+| `AR_LINK_HOURS` | عمر لینک به ساعت (پیش‌فرض ۲۴). |
+| `PUBLIC_BASE_URL` | اختیاری: آدرس عمومی سرور برای ساختن لینک (مثلاً `https://ar.beestoon.com`)؛ وگرنه از آدرس درخواست ساخته می‌شود. |
+
+پیشنهاد برای Spaces: یک Lifecycle rule روی پیشوند `ar-snapshots/` (حذف بعد از ۲ روز) به‌عنوان پشتیبان پاک‌سازی خود سرور.

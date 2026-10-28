@@ -140,3 +140,31 @@ export function requireEditor(req, res, next) {
 
     next();
 }
+
+
+/*
+ * Express middleware: any approved member of a live
+ * session (admin, editor or viewer) may use the route.
+ */
+export function requireMember(req, res, next) {
+
+    const header = String(req.headers.authorization || '');
+
+    const ticket = header.startsWith('Bearer ')
+        ? header.slice(7).trim()
+        : '';
+
+    const entry = ticket ? tickets.get(ticket) : null;
+
+    if (!entry) {
+        res.status(401).send('Join a session first (missing or expired ticket)');
+        return;
+    }
+
+    if (!entry.room.roleOf(entry.userId)) {
+        res.status(403).send('Wait until an admin lets you in');
+        return;
+    }
+
+    next();
+}

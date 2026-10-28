@@ -17,3 +17,9 @@ services:
         value: dev
       - key: ALLOW_DEV_AUTH
         value: "true"
+      # AR share links: "local" until DigitalOcean Spaces
+      # is set up (then AR_STORAGE=s3 + S3_* keys, see README)
+      - key: AR_STORAGE
+        value: local
+      - key: AR_LINK_HOURS
+        value: "24"
