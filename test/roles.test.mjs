@@ -44,13 +44,13 @@ function check(label, fn) {
  * One test user. Records every message so checks
  * can ask "did X arrive?" afterwards.
  */
-async function connect(name, sessionKey, mode = 'join') {
+async function connect(name, sessionKey, mode = 'join', email = undefined) {
 
     const client = new Client(URL);
 
     const room = await client[mode]('session', {
         sessionKey,
-        identity: { userId: name.toLowerCase(), name }
+        identity: { userId: name.toLowerCase(), name, email }
     });
 
     const user = { name, room, messages: [], state: null, leftCode: null };
@@ -141,7 +141,9 @@ const server = spawn(process.execPath, ['src/index.mjs'], {
         AUTH_PROVIDER: 'dev',
         ALLOW_DEV_AUTH: 'true',
         ADMIN_GRACE_SECONDS: '2',
-        RECONNECT_WINDOW: '1'
+        RECONNECT_WINDOW: '1',
+        // Invite emails go to the server log
+        MAIL_PROVIDER: 'log'
     },
     stdio: ['ignore', 'pipe', 'pipe']
 });
@@ -342,9 +344,42 @@ async function main() {
         assert.equal(eve2.state.you.role, 'editor');
     });
 
+
+    console.log('\nSame login in a second browser');
+
+    admin.clear();
     const eve3 = await connect('Eve', KEY);
-    await waitFor(() => eve2.leftCode !== null, 'old tab replaced');
-    check('same user in a new tab replaces the old one (4104)', () => assert.equal(eve2.leftCode, 4104));
+    await waitFor(() => userIn(admin, 'Eve')?.devices === 2, 'eve on two devices');
+    check('second browser joins as the same person, same role, no waiting', () => {
+        assert.equal(eve3.state.you.status, 'approved');
+        assert.equal(eve3.state.you.role, 'editor');
+        assert.equal(eve2.leftCode, null, 'first browser stays connected');
+        assert.equal(admin.state.users.filter((u) => u.name === 'Eve').length, 1, 'one row');
+        assert.ok(admin.state.connections >= 4, 'admin sees the connection count');
+    });
+
+    check('no join request for a second browser', () => {
+        assert.ok(!admin.got('join:request', (p) => p.name === 'Eve'));
+    });
+
+    eve2.clear();
+    eve3.clear();
+    bob.send('object:add', { id: 'vase', name: 'vase.glb', dataUrl: TINY_GLB, transform: POSE(0) });
+    await waitFor(() => eve2.got('object:add', (p) => p.id === 'vase') && eve3.got('object:add', (p) => p.id === 'vase'), 'both eve browsers get vase');
+    check('both browsers receive changes', () => {});
+
+    eve3.clear();
+    eve2.send('object:transform', { id: 'vase', ...POSE(7) });
+    await waitFor(() => eve3.got('object:transform', (p) => p.id === 'vase' && p.position[0] === 7), 'eve3 sees eve2 move');
+    check('a change in one browser reaches the person\'s other browser', () => {});
+
+    eve2.send('object:release', { id: 'vase' });
+    eve2.send('session:leave', { choice: 'keep' });
+    await waitFor(() => eve2.leftCode !== null && userIn(admin, 'Eve')?.devices === 1, 'eve2 left');
+    check('leaving in one browser keeps the other one in', () => {
+        assert.equal(eve3.leftCode, null);
+        assert.equal(userIn(admin, 'Eve').online, true);
+    });
 
 
     console.log('\nAn admin leaves while another admin is online');
@@ -411,6 +446,65 @@ async function main() {
 
     const KEY3 = 'test-session-0003';
     const again = await connect('Zed', KEY3, 'create');
+
+
+    console.log('\nEmail invites');
+
+    const KEY4 = 'test-session-0004';
+    const host = await connect('Hana', KEY4, 'create');
+    const LINK4 = `https://example.test/launch?session=${KEY4}`;
+
+    check('admins are told the server can send invites', () => {
+        assert.equal(host.state.features?.emailInvites, true);
+    });
+
+    host.send('invite:email', { emails: ['Gus@Example.com', 'not-an-email'], role: 'viewer', link: LINK4 });
+    await waitFor(() => host.got('invite:result'), 'invite result');
+    check('invite is sent to valid addresses and reports the bad ones', () => {
+        const r = host.messages.find((m) => m.type === 'invite:result').payload;
+        assert.deepEqual(r.sent, ['gus@example.com']);
+        assert.equal(r.failed.length, 1);
+        assert.ok(serverLog.includes('[mail] invite to gus@example.com'));
+    });
+
+    host.clear();
+    host.send('invite:email', { emails: ['x@example.com'], role: 'editor', link: 'https://example.test/?session=other-session-9' });
+    await waitFor(() => host.got('action:denied', (p) => p.type === 'invite:email'), 'wrong link denied');
+    check('an invite link for another session is refused', () => {});
+
+    const gus = await connect('Gus', KEY4, 'join', 'gus@example.com');
+    check('invited email joins straight away with the invited role', () => {
+        assert.equal(gus.state.you.status, 'approved');
+        assert.equal(gus.state.you.role, 'viewer');
+    });
+
+    const ivy = await connect('Ivy', KEY4, 'join', 'ivy@example.com');
+    check('someone who was not invited still waits', () => assert.equal(ivy.state.you.status, 'pending'));
+
+    host.send('join:approve', { userId: 'dev:ivy', role: 'editor' });
+    await waitFor(() => ivy.state.you.status === 'approved', 'ivy approved');
+    ivy.clear();
+    ivy.send('invite:email', { emails: ['y@example.com'], role: 'admin', link: LINK4 });
+    await waitFor(() => ivy.got('action:denied', (p) => p.type === 'invite:email'), 'editor invite denied');
+    check('only admins can invite', () => assert.equal(ivy.state.features?.emailInvites, false));
+
+
+    console.log('\nAdmin in two browsers');
+
+    const hana2 = await connect('Hana', KEY4);
+    await waitFor(() => userIn(host, 'Hana')?.devices === 2, 'hana on two devices');
+    host.send('session:leave', { choice: 'keep' });
+    await waitFor(() => host.leftCode !== null, 'hana first browser left');
+    await sleep(300);
+    check('admin leaving one of two browsers does not close the session', () => {
+        assert.notEqual(host.leftCode, 4103);
+        assert.equal(gus.leftCode, null);
+        assert.equal(hana2.state.you.role, 'admin');
+    });
+
+    hana2.send('session:leave', { choice: 'close' });
+    await waitFor(() => gus.leftCode !== null, 'session closed');
+    check('closing from the last browser ends it for everyone (4103)', () => assert.equal(gus.leftCode, 4103));
 
 
     console.log('\nAdmin alone leaves -> session closed');

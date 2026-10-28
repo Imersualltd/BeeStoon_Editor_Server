@@ -4,7 +4,8 @@
  * The room never looks at logins itself. It asks the
  * adapter chosen by the AUTH_PROVIDER env variable:
  *
- *   verify({ token, options }) -> { userId, name }
+ *   verify({ token, options }) -> { userId, name, email }
+ *   (email may be null; it is only used for invites)
  *
  * and throws if the user is not allowed in.
  *

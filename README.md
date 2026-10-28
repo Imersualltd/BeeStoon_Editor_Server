@@ -60,7 +60,29 @@ npm test
 | متغیر | توضیح |
 |---|---|
 | `AUTH_PROVIDER=dev` | به `identity: { userId, name }` که کلاینت می‌فرستد اعتماد می‌کند. فقط برای توسعه؛ نیاز به `ALLOW_DEV_AUTH=true` دارد. |
-| `AUTH_PROVIDER=jwt` | توکن امضاشده سایت (مثلاً BeeStoon) را بررسی می‌کند: `JWT_SECRET` (HS256) یا `JWT_PUBLIC_KEY` (RS256)، و اختیاری `JWT_ISSUER`. `sub` = شناسه، `name` = نام. |
+| `AUTH_PROVIDER=jwt` | توکن امضاشده سایت (مثلاً BeeStoon) را بررسی می‌کند: `JWT_SECRET` (HS256) یا `JWT_PUBLIC_KEY` (RS256)، و اختیاری `JWT_ISSUER`. `sub` = شناسه، `name` = نام، `email` = برای دعوت ایمیلی. |
+
+### یک نفر در چند مرورگر
+
+همان `userId` (همان لاگین BeeStoon) در چند مرورگر یا دستگاه **یک نفر** است: نقش و دسترسی‌اش
+حفظ می‌شود و دوباره منتظر تأیید نمی‌ماند. هر دو اتصال باز می‌مانند (دیگر کد `4104` فرستاده نمی‌شود).
+در `session:state` هر نفر `devices` دارد (تعداد مرورگرهای باز) و admin مقدار `connections`
+(کل اتصال‌ها، که هزینه سرور بر اساس آن است) را می‌بیند. Leave در یک مرورگر فقط همان مرورگر را
+می‌بندد، مگر اینکه جلسه را ببندد.
+
+### دعوت با ایمیل
+
+| متغیر | توضیح |
+|---|---|
+| `MAIL_PROVIDER=resend` | ایمیل از طریق [Resend](https://resend.com): `RESEND_API_KEY` و `INVITE_FROM` (مثلاً `Beestoon <invite@beestoon.com>`، دامنه باید در Resend تأیید شده باشد). |
+| `MAIL_PROVIDER=log` | ایمیل فقط در لاگ سرور چاپ می‌شود (توسعه و تست). |
+| (تنظیم نشده) | دعوت ایمیلی سمت سرور خاموش است؛ کلاینت برنامه ایمیل خود admin را باز می‌کند. |
+| `INVITE_BASE_URL` | اختیاری: اگر لینکی که کلاینت می‌فرستد معتبر نباشد، لینک دعوت از این آدرس + `?session=` ساخته می‌شود. |
+
+وقتی ایمیل فعال است، `session:state.features.emailInvites = true` (فقط برای admin).
+admin پیام `invite:email` را با `{ emails, role, link }` می‌فرستد (حداکثر ۲۰ آدرس در هر پیام،
+۵۰ دعوت در ساعت برای هر جلسه) و جواب `invite:result { sent, failed }` می‌گیرد. کسی که با همان
+ایمیل وارد شود، بدون انتظار با همان نقش وارد جلسه می‌شود.
 
 ### مسیرهای HTTP
 
@@ -82,6 +104,8 @@ npm test
 | admin → سرور | `role:set` | `{ userId, role }` |
 | admin → سرور | `object:assign` / `object:unassign` / `object:swap` | `{ id, userId }` / `{ id }` / `{ idA, idB }` |
 | admin → سرور | `user:kick` / `session:close` | `{ userId }` / `{}` |
+| admin → سرور | `invite:email` | `{ emails, role, link }` |
+| سرور → admin | `invite:result` | `{ sent, failed }` |
 | سرور → کلاینت | `session:state` | وضعیت جلسه، شخصی برای هر نفر |
 | سرور → admin | `join:request` | `{ userId, name }` |
 | سرور → کلاینت | `object:list` | `{ serverId, ids }` |
@@ -91,8 +115,8 @@ npm test
 | سرور → فرستنده | `action:denied` | `{ type, reason }` |
 | سرور → کلاینت | `session:notice` / `session:closed` | `{ text }` / `{ by }` |
 
-کدهای قطع اتصال: `4101` اخراج، `4102` رد درخواست، `4103` بسته شدن جلسه،
-`4104` باز شدن در پنجره دیگر.
+کدهای قطع اتصال: `4101` اخراج، `4102` رد درخواست، `4103` بسته شدن جلسه
+(`4104` دیگر فرستاده نمی‌شود؛ چند مرورگر مجاز است).
 
 ## خروجی FBX
 
