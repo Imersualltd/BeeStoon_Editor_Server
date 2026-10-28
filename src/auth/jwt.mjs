@@ -14,11 +14,16 @@
  * Token claims used:
  *   sub   -> userId (required)
  *   name  -> display name (or preferred_username)
+ *   email -> matched against email invites (ignored
+ *            when email_verified is false)
+ *
+ * The same "sub" in several browsers is one person
+ * (ModelRoom keeps all their connections).
  */
 
 import jwt from 'jsonwebtoken';
 
-import { cleanName, USER_ID_PATTERN } from './util.mjs';
+import { cleanEmail, cleanName, USER_ID_PATTERN } from './util.mjs';
 
 
 function keyAndAlgorithms() {
@@ -71,7 +76,8 @@ export const jwtAdapter = {
 
         return {
             userId: `jwt:${userId}`,
-            name: cleanName(payload.name || payload.preferred_username) || 'User'
+            name: cleanName(payload.name || payload.preferred_username) || 'User',
+            email: payload.email_verified === false ? null : cleanEmail(payload.email)
         };
     }
 };

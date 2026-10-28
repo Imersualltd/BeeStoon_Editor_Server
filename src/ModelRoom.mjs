@@ -36,7 +36,18 @@
  *                         closing the tab and not coming back
  *                         within RECONNECT_WINDOW)
  *
+ *   One person (same userId, i.e. the same login) may
+ *   be connected from several browsers at once. They
+ *   are one entry in users[] with devices = how many
+ *   connections are open; every connection gets the
+ *   same state and models. Leave in one browser only
+ *   closes that browser (unless it closes the session).
+ *
  *   client -> server (admins only)
+ *     'invite:email'      { emails: [..], role, note?, link }
+ *                         (only when features.emailInvites; the
+ *                         invited email signs in -> approved with
+ *                         that role, no waiting)
  *     'join:approve'      { userId, role }
  *     'join:deny'         { userId }
  *     'role:set'          { userId, role }
@@ -50,6 +61,7 @@
  *     'session:state'     see stateFor() - sent on every
  *                         change of people, roles or locks
  *     'join:request'      { userId, name }   (admins)
+ *     'invite:result'     { sent: [email], failed: [{ email, reason }] }
  *     'session:notice'    { text }
  *     'session:closed'    { by }
  *     'object:list'       { serverId, ids: [id, ...] }
@@ -63,7 +75,8 @@
  *
  * Leave codes the client can show:
  *   4101 kicked, 4102 denied, 4103 session closed,
- *   4104 opened in another tab/window
+ *   4104 opened in another tab/window (no longer sent:
+ *   several browsers are allowed)
  *
  * sync-request: unchanged from the single-room
  * version - full id list, then 'object:add' for every
@@ -79,6 +92,8 @@ import { randomUUID } from 'node:crypto';
 import { Room, ServerError } from 'colyseus';
 
 import { getAuthAdapter } from './auth/index.mjs';
+import { cleanEmail } from './auth/util.mjs';
+import { mailerReady, sendInvite } from './mailer.mjs';
 import {
     issueTicket,
     markClosed,
@@ -111,6 +126,11 @@ const ADMIN_GRACE_SECONDS =
 const ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
 
 const ROLES = ['admin', 'editor', 'viewer'];
+
+// Email invites: addresses per message, and per
+// session per hour (spam brake)
+const MAX_INVITES_PER_MESSAGE = 20;
+const MAX_INVITES_PER_HOUR = 50;
 
 export const LEAVE_CODES = {
     KICKED: 4101,
@@ -145,10 +165,19 @@ export class ModelRoom extends Room {
 
         this.sessionKey = sessionKey;
 
-        // userId -> { userId, name, role, status,
-        //             joinedAt, online, client }
+        // userId -> { userId, name, email, role, status,
+        //             joinedAt, online, clients, dropped }
         // status: 'pending' | 'approved'
+        // clients: open connections (one per browser)
+        // dropped: connections waiting to reconnect
+        // online = at least one open connection
         this.users = new Map();
+
+        // Invited email -> role (used up on first join)
+        this.invites = new Map();
+
+        // Times (ms) invites were sent, for the limit
+        this.inviteTimes = [];
 
         // Kicked users cannot come back
         this.banned = new Set();
@@ -214,24 +243,16 @@ export class ModelRoom extends Room {
 
     onJoin(client) {
 
-        const { userId, name } = client.auth;
+        const { userId, name, email = null } = client.auth;
 
         client.userData = { userId };
 
 
         let user = this.users.get(userId);
 
-
-        // Same person in a second tab or device: the
-        // newest connection wins.
-        if (user?.client && user.client !== client && user.online) {
-
-            const old = user.client;
-
-            old.userData = { ...old.userData, noReconnect: true };
-
-            old.leave(LEAVE_CODES.REPLACED, 'Opened in another window');
-        }
+        // Same person in another browser or device: both
+        // stay connected (see header)
+        const wasOnline = !!user?.online;
 
 
         if (!user) {
@@ -239,11 +260,13 @@ export class ModelRoom extends Room {
             user = {
                 userId,
                 name,
+                email,
                 role: null,
                 status: 'pending',
                 joinedAt: Date.now(),
-                online: true,
-                client
+                online: false,
+                clients: new Set(),
+                dropped: new Set()
             };
 
             // The creator of the session is its first admin
@@ -253,6 +276,16 @@ export class ModelRoom extends Room {
 
                 user.status = 'approved';
                 user.role = 'admin';
+
+            } else if (email && this.invites.has(email)) {
+
+                // Invited by email: in straight away
+                user.status = 'approved';
+                user.role = this.invites.get(email);
+
+                this.invites.delete(email);
+
+                console.log(`[${this.roomId}] "${name}" joins by email invite as ${user.role}`);
             }
 
             this.users.set(userId, user);
@@ -261,29 +294,31 @@ export class ModelRoom extends Room {
 
             // Returning approved users keep their role
             user.name = name;
+            user.email = email || user.email;
         }
 
 
-        user.client = client;
-        user.online = true;
+        user.clients.add(client);
+
+        this.refreshOnline(user);
 
 
         if (user.status === 'approved') {
 
             user.ticket = user.ticket || issueTicket(this, userId);
 
-        } else {
+        } else if (!wasOnline) {
 
             for (const admin of this.onlineUsers('admin')) {
-                admin.client.send('join:request', { userId, name });
+                this.sendToUser(admin, 'join:request', { userId, name });
             }
         }
 
 
         console.log(
             `[${this.roomId}] join "${name}" (${userId}) as ` +
-            `${user.status === 'approved' ? user.role : 'pending'} ` +
-            `(${this.clients.length} online)`
+            `${user.status === 'approved' ? user.role : 'pending'}, ` +
+            `${user.clients.size} browser(s) (${this.clients.length} connections)`
         );
 
 
@@ -301,9 +336,12 @@ export class ModelRoom extends Room {
 
         const user = this.userOf(client);
 
-        if (user && user.client === client) {
+        if (user?.clients.has(client)) {
 
-            user.online = false;
+            user.clients.delete(client);
+            user.dropped.add(client);
+
+            this.refreshOnline(user);
 
             this.sendState();
         }
@@ -321,10 +359,12 @@ export class ModelRoom extends Room {
 
         const user = this.userOf(client);
 
-        if (user) {
+        if (user?.dropped.has(client)) {
 
-            user.client = client;
-            user.online = true;
+            user.dropped.delete(client);
+            user.clients.add(client);
+
+            this.refreshOnline(user);
 
             this.sendState();
         }
@@ -333,18 +373,35 @@ export class ModelRoom extends Room {
     }
 
 
-    // Final leave: on purpose, kicked, or the
-    // reconnection window ran out.
+    // Final leave of one connection: on purpose,
+    // kicked, or the reconnection window ran out.
     onLeave(client) {
 
         const user = this.userOf(client);
 
-        if (!user || user.client !== client) {
-            return;   // replaced by a newer connection
+        if (!user || (!user.clients.has(client) && !user.dropped.has(client))) {
+            return;   // already removed (kicked, denied ...)
         }
 
-        user.online = false;
-        user.client = null;
+        user.clients.delete(client);
+        user.dropped.delete(client);
+
+        this.refreshOnline(user);
+
+
+        // Still here in another browser (or one that may
+        // reconnect): only that connection went away
+        if (user.clients.size || user.dropped.size) {
+
+            console.log(
+                `[${this.roomId}] "${user.name}" closed one browser, ` +
+                `${user.clients.size} still open`
+            );
+
+            this.sendState();
+
+            return;
+        }
 
         // Pending people who give up are forgotten
         if (user.status === 'pending') {
@@ -821,6 +878,151 @@ export class ModelRoom extends Room {
 
             this.closeSession(admin);
         });
+
+
+        this.onAdmin('invite:email', (client, admin, data) => {
+
+            this.inviteByEmail(client, admin, data).catch((error) => {
+
+                console.error(`[${this.roomId}] invite failed: ${error.message}`);
+
+                this.actionDenied(client, 'invite:email', 'The invite could not be sent');
+            });
+        });
+    }
+
+
+    // ==============================================
+    // EMAIL INVITES
+    // ==============================================
+
+    /*
+     * Emails the session link. Whoever signs in with an
+     * invited address is approved with that role. The
+     * link must point at this session (its ?session=).
+     */
+    async inviteByEmail(client, admin, data) {
+
+        if (!mailerReady()) {
+            return this.actionDenied(client, 'invite:email', 'Email invites are not set up on this server');
+        }
+
+
+        const role = ROLES.includes(data?.role) ? data.role : null;
+
+        if (!role) {
+            return this.actionDenied(client, 'invite:email', 'Unknown role');
+        }
+
+
+        const link = this.inviteLink(data?.link);
+
+        if (!link) {
+            return this.actionDenied(client, 'invite:email', 'The invite link does not belong to this session');
+        }
+
+
+        const raw = Array.isArray(data?.emails) ? data.emails.slice(0, MAX_INVITES_PER_MESSAGE) : [];
+
+        const emails = [...new Set(raw.map(cleanEmail).filter(Boolean))];
+
+        const failed = raw
+            .filter((value) => !cleanEmail(value))
+            .map((value) => ({ email: String(value ?? '').slice(0, 100), reason: 'Not an email address' }));
+
+
+        // Spam brake: so many per session per hour
+        const hourAgo = Date.now() - 60 * 60 * 1000;
+
+        this.inviteTimes = this.inviteTimes.filter((t) => t > hourAgo);
+
+        const room = Math.max(0, MAX_INVITES_PER_HOUR - this.inviteTimes.length);
+
+        for (const email of emails.slice(room)) {
+            failed.push({ email, reason: 'Too many invites this hour' });
+        }
+
+
+        const note = String(data?.note ?? '')
+            .replace(/[\u0000-\u001f\u007f<>]/g, ' ')
+            .replace(/\s+/g, ' ')
+            .trim()
+            .slice(0, 300);
+
+        const sent = [];
+
+        for (const email of emails.slice(0, room)) {
+
+            this.inviteTimes.push(Date.now());
+
+            try {
+
+                await sendInvite({ to: email, from: admin.name, role, note, link });
+
+                this.invites.set(email, role);
+
+                sent.push(email);
+
+            } catch (error) {
+
+                failed.push({ email, reason: error.message || 'Could not send' });
+            }
+        }
+
+
+        console.log(
+            `[${this.roomId}] ${admin.name} invited ${sent.length} by email as ${role}` +
+            (failed.length ? ` (${failed.length} failed)` : '')
+        );
+
+
+        // The admin may have left meanwhile
+        try {
+            client.send('invite:result', { sent, failed });
+        } catch {
+            // gone
+        }
+    }
+
+
+    // The client's share link if it opens this session,
+    // else INVITE_BASE_URL?session=<key>, else null
+    inviteLink(value) {
+
+        try {
+
+            const url = new URL(String(value ?? ''));
+
+            if (
+                (url.protocol === 'https:' || url.protocol === 'http:') &&
+                url.searchParams.get('session') === this.sessionKey
+            ) {
+                url.hash = '';
+
+                return url.toString();
+            }
+
+        } catch {
+            // not a URL
+        }
+
+
+        if (process.env.INVITE_BASE_URL) {
+
+            try {
+
+                const url = new URL(process.env.INVITE_BASE_URL);
+
+                url.searchParams.set('session', this.sessionKey);
+
+                return url.toString();
+
+            } catch {
+                // bad setting
+            }
+        }
+
+        return null;
     }
 
 
@@ -840,6 +1042,19 @@ export class ModelRoom extends Room {
         this.onApproved('session:leave', (client, user, data) => {
 
             const choice = data?.choice || 'keep';
+
+
+            // Still open in another browser: only this one
+            // leaves (unless it closes the session)
+            if (user.clients.size > 1 && choice !== 'close') {
+
+                client.userData = { ...client.userData, noReconnect: true };
+
+                client.leave();
+
+                return;
+            }
+
 
             const lastAdmin =
                 user.role === 'admin' &&
@@ -1052,7 +1267,8 @@ export class ModelRoom extends Room {
             userId: user.userId,
             name: user.name,
             status: user.status,
-            role: user.role
+            role: user.role,
+            devices: user.clients.size
         };
 
 
@@ -1081,7 +1297,9 @@ export class ModelRoom extends Room {
                 role: u.role,
                 status: u.status,
                 online: u.online,
-                joinedAt: u.joinedAt
+                joinedAt: u.joinedAt,
+                // Browsers this person has open
+                devices: u.clients.size
             });
         }
 
@@ -1106,7 +1324,11 @@ export class ModelRoom extends Room {
             users,
             objects,
             adminGraceSeconds: ADMIN_GRACE_SECONDS,
-            noAdminSince: this.noAdminSince
+            noAdminSince: this.noAdminSince,
+            // Open connections in total (what hosting
+            // costs are counted by), for admins
+            connections: isAdmin ? this.clients.length : undefined,
+            features: { emailInvites: isAdmin && mailerReady() }
         };
     }
 
@@ -1115,25 +1337,34 @@ export class ModelRoom extends Room {
 
         for (const user of this.users.values()) {
 
-            if (user.online && user.client) {
-                user.client.send('session:state', this.stateFor(user));
+            if (user.online) {
+                this.sendToUser(user, 'session:state', this.stateFor(user));
+            }
+        }
+    }
+
+
+    // To every open browser of one person
+    sendToUser(user, type, message, except) {
+
+        for (const client of user.clients) {
+
+            if (client !== except) {
+                client.send(type, message);
             }
         }
     }
 
 
     // Like broadcast, but never to pending people
+    // (except = the sending connection; the sender's
+    // other browsers do get it)
     sendApproved(type, message, except) {
 
         for (const user of this.users.values()) {
 
-            if (
-                user.status === 'approved' &&
-                user.online &&
-                user.client &&
-                user.client !== except
-            ) {
-                user.client.send(type, message);
+            if (user.status === 'approved' && user.online) {
+                this.sendToUser(user, type, message, except);
             }
         }
     }
@@ -1157,17 +1388,20 @@ export class ModelRoom extends Room {
     }
 
 
+    // Every browser of this person
     disconnectUser(user, code, reason) {
 
-        const client = user.client;
+        const clients = [...user.clients, ...user.dropped];
 
-        user.online = false;
-        user.client = null;
+        user.clients.clear();
+        user.dropped.clear();
+
+        this.refreshOnline(user);
 
         revokeTickets(this, user.userId);
         this.releaseHoldsOf(user.userId);
 
-        if (client) {
+        for (const client of clients) {
 
             client.userData = { ...client.userData, noReconnect: true };
 
@@ -1185,6 +1419,12 @@ export class ModelRoom extends Room {
         const userId = client?.userData?.userId ?? client?.auth?.userId;
 
         return userId ? this.users.get(userId) : null;
+    }
+
+
+    refreshOnline(user) {
+
+        user.online = user.clients.size > 0;
     }
 
 
@@ -1220,7 +1460,7 @@ export class ModelRoom extends Room {
 
             const user = this.userOf(client);
 
-            if (!user || user.status !== 'approved' || user.client !== client) {
+            if (!user || user.status !== 'approved' || !user.clients.has(client)) {
                 return;
             }
 

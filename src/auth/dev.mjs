@@ -11,7 +11,7 @@
  * a production deployment.
  */
 
-import { cleanName, USER_ID_PATTERN } from './util.mjs';
+import { cleanEmail, cleanName, USER_ID_PATTERN } from './util.mjs';
 
 
 export const devAdapter = {
@@ -39,7 +39,9 @@ export const devAdapter = {
 
         return {
             userId: `dev:${userId}`,
-            name: cleanName(identity?.name) || 'Guest'
+            name: cleanName(identity?.name) || 'Guest',
+            // Unchecked, like everything here (tests)
+            email: cleanEmail(identity?.email)
         };
     }
 };
