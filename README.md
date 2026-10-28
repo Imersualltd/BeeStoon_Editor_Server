@@ -80,7 +80,7 @@ npm test
 | `INVITE_BASE_URL` | اختیاری: اگر لینکی که کلاینت می‌فرستد معتبر نباشد، لینک دعوت از این آدرس + `?session=` ساخته می‌شود. |
 
 وقتی ایمیل فعال است، `session:state.features.emailInvites = true` (فقط برای admin).
-admin پیام `invite:email` را با `{ emails, role, note?, link }` می‌فرستد (حداکثر ۲۰ آدرس در هر پیام،
+admin پیام `invite:email` را با `{ emails, role, link }` می‌فرستد (حداکثر ۲۰ آدرس در هر پیام،
 ۵۰ دعوت در ساعت برای هر جلسه) و جواب `invite:result { sent, failed }` می‌گیرد. کسی که با همان
 ایمیل وارد شود، بدون انتظار با همان نقش وارد جلسه می‌شود.
 
@@ -104,7 +104,7 @@ admin پیام `invite:email` را با `{ emails, role, note?, link }` می‌�
 | admin → سرور | `role:set` | `{ userId, role }` |
 | admin → سرور | `object:assign` / `object:unassign` / `object:swap` | `{ id, userId }` / `{ id }` / `{ idA, idB }` |
 | admin → سرور | `user:kick` / `session:close` | `{ userId }` / `{}` |
-| admin → سرور | `invite:email` | `{ emails, role, note?, link }` |
+| admin → سرور | `invite:email` | `{ emails, role, link }` |
 | سرور → admin | `invite:result` | `{ sent, failed }` |
 | سرور → کلاینت | `session:state` | وضعیت جلسه، شخصی برای هر نفر |
 | سرور → admin | `join:request` | `{ userId, name }` |

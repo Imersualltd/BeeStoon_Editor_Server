@@ -458,7 +458,7 @@ async function main() {
         assert.equal(host.state.features?.emailInvites, true);
     });
 
-    host.send('invite:email', { emails: ['Gus@Example.com', 'not-an-email'], role: 'viewer', note: 'Come in', link: LINK4 });
+    host.send('invite:email', { emails: ['Gus@Example.com', 'not-an-email'], role: 'viewer', link: LINK4 });
     await waitFor(() => host.got('invite:result'), 'invite result');
     check('invite is sent to valid addresses and reports the bad ones', () => {
         const r = host.messages.find((m) => m.type === 'invite:result').payload;

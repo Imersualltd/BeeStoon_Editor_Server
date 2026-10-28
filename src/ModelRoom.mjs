@@ -44,7 +44,8 @@
  *   closes that browser (unless it closes the session).
  *
  *   client -> server (admins only)
- *     'invite:email'      { emails: [..], role, note?, link }
+ *     'invite:email'      { emails: [..], role, link }
+ *                         (standard text + "Join session" button)
  *                         (only when features.emailInvites; the
  *                         invited email signs in -> approved with
  *                         that role, no waiting)
@@ -943,12 +944,6 @@ export class ModelRoom extends Room {
         }
 
 
-        const note = String(data?.note ?? '')
-            .replace(/[\u0000-\u001f\u007f<>]/g, ' ')
-            .replace(/\s+/g, ' ')
-            .trim()
-            .slice(0, 300);
-
         const sent = [];
 
         for (const email of emails.slice(0, room)) {
@@ -957,7 +952,7 @@ export class ModelRoom extends Room {
 
             try {
 
-                await sendInvite({ to: email, from: admin.name, role, note, link });
+                await sendInvite({ to: email, from: admin.name, role, link });
 
                 this.invites.set(email, role);
 

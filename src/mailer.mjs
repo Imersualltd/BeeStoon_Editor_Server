@@ -48,30 +48,36 @@ export function mailerReady() {
 
 
 /*
- * One invite email. Resolves when it was accepted,
+ * One invite email: a standard text and a "Join
+ * session" button. Resolves when it was accepted,
  * throws with a short reason otherwise.
- *   { to, from, role, note, link }
+ *   { to, from, role, link }
  *   from = the admin's display name
  */
-export async function sendInvite({ to, from, role, note, link }) {
+export async function sendInvite({ to, from, role, link }) {
 
     const subject = `${from} invited you to a Beestoon session`;
 
-    const lines = [
+    const text = [
         `${from} invited you to work together in a Beestoon session as ${role}.`,
-        note ? `\n${note}\n` : '',
-        `Join here: ${link}`,
+        '',
+        `Join the session: ${link}`,
         '',
         'Sign in with your BeeStoon account using this email address and you are let in straight away.'
-    ];
+    ].join('\n');
 
-    const text = lines.join('\n');
-
-    const html =
-        `<p>${escapeHtml(from)} invited you to work together in a Beestoon session as <b>${escapeHtml(role)}</b>.</p>` +
-        (note ? `<p>${escapeHtml(note)}</p>` : '') +
-        `<p><a href="${escapeHtml(link)}">Join the session</a></p>` +
-        '<p>Sign in with your BeeStoon account using this email address and you are let in straight away.</p>';
+    const html = `
+        <div style="font-family:Arial,Helvetica,sans-serif;font-size:15px;line-height:1.5;color:#1f2937">
+            <p>${escapeHtml(from)} invited you to work together in a Beestoon session as <b>${escapeHtml(role)}</b>.</p>
+            <p style="margin:24px 0">
+                <a href="${escapeHtml(link)}"
+                    style="display:inline-block;padding:12px 24px;border-radius:8px;background:#22c55e;
+                    color:#ffffff;font-weight:bold;text-decoration:none">Join session</a>
+            </p>
+            <p style="color:#6b7280;font-size:13px">Sign in with your BeeStoon account using this email address
+            and you are let in straight away. If the button does not work, open this link:<br>
+            <a href="${escapeHtml(link)}" style="color:#16a34a">${escapeHtml(link)}</a></p>
+        </div>`;
 
 
     const name = provider();
