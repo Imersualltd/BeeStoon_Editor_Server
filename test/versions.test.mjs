@@ -322,6 +322,15 @@ async function main() {
         assert.equal(unchanged.some((v) => v.name === 'Before restore'), false);
     });
 
+    await waitFor(() => ada.state.scene.latest?.name === 'Restored "First layout"', 'restored saved');
+    check('the restored scene is saved as the latest version (re-opening starts from it)', () => {
+        const restored = unchanged.find((v) => v.name === 'Restored "First layout"') ||
+            ada.state.scene.latest;
+        assert.equal(restored.auto, true);
+        assert.equal(restored.objectCount, 1);
+        assert.equal(ada.state.scene.dirty, false);
+    });
+
     // Unsaved change, then restore "With lamp"
     bob.send('object:transform', { id: 'chair', ...pose(9) });
     await waitFor(() => ada.state.scene.dirty, 'dirty again');
