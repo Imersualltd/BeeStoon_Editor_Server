@@ -1268,6 +1268,11 @@ export class ModelRoom extends Room {
                 return this.actionDenied(client, 'role:set', 'Unknown role');
             }
 
+            // Only the owner changes their own role
+            if (user.userId === this.owner?.userId && user !== admin) {
+                return this.actionDenied(client, 'role:set', 'Only the owner can change their own role');
+            }
+
 
             // There must always be an online admin
             if (
@@ -1369,6 +1374,11 @@ export class ModelRoom extends Room {
 
             if (user === admin) {
                 return this.actionDenied(client, 'user:kick', 'Use Leave to leave the session');
+            }
+
+            // The owner can only leave by themselves
+            if (user.userId === this.owner?.userId) {
+                return this.actionDenied(client, 'user:kick', 'The owner of the session cannot be removed');
             }
 
 
