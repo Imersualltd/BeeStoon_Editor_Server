@@ -41,11 +41,12 @@ const closedKeys = new Map();
 const CLOSED_KEY_MS = 24 * 60 * 60 * 1000;
 
 
-export function registerSession(sessionKey, room) {
+export function registerSession(sessionKey, room, { reopen = false } = {}) {
 
     // Closed first: a just-closed room may not be
-    // disposed yet
-    if (isClosed(sessionKey)) {
+    // disposed yet. A saved session can be opened again
+    // by its owner (the room checks who).
+    if (isClosed(sessionKey) && !(reopen && !rooms.has(sessionKey))) {
         throw new ServerError(410, 'This session has been closed');
     }
 
@@ -54,6 +55,10 @@ export function registerSession(sessionKey, room) {
     }
 
     rooms.set(sessionKey, room);
+
+    if (reopen) {
+        closedKeys.delete(sessionKey);
+    }
 }
 
 

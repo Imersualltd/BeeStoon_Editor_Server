@@ -46,7 +46,20 @@
  *   same state and models. Leave in one browser only
  *   closes that browser (unless it closes the session).
  *
+ *     'scene:save'        { name, description? }  (admins + editors)
+ *     'scene:versions'    {}  -> 'scene:versions' { versions }
+ *
+ *   Saved sessions (scene-versions.mjs): the first save
+ *   makes the session a saved session owned by its
+ *   creator. Autosave every AUTOSAVE_MINUTES while
+ *   something changed, and when the session ends. The
+ *   same link opens it again later: only the owner can
+ *   start it, then people who were in it come back with
+ *   their role.
+ *
  *   client -> server (admins only)
+ *     'scene:restore'     { versionId }  (unsaved changes are
+ *                         saved first as "Before restore")
  *     'invite:email'      { emails: [..], role, link }
  *                         (standard text + "Join session" button)
  *                         (only when features.emailInvites; the
@@ -77,6 +90,9 @@
  *     'object:denied'     { id, reason, transform? }  (no permission;
  *                         transform = the pose to snap back to)
  *     'action:denied'     { type, reason }   (admin action refused)
+ *     'scene:saved'       { version }   (version summary)
+ *     'scene:restored'    { version, by }
+ *                         (then object:remove / add / transform)
  *
  * Leave codes the client can show:
  *   4101 kicked, 4102 denied, 4103 session closed,
@@ -104,8 +120,18 @@ import { Room, ServerError } from 'colyseus';
 import { getAuthAdapter } from './auth/index.mjs';
 import { cleanEmail } from './auth/util.mjs';
 import { mailerReady, sendInvite } from './mailer.mjs';
-import { ASSET_ID_PATTERN, SCENE_ID_PATTERN } from './assets.mjs';
+import { ASSET_ID_PATTERN, blobKey, SCENE_ID_PATTERN } from './assets.mjs';
 import { SESSION_TYPES, sessionTypeOf } from './session-types.mjs';
+import { getSceneStorage } from './scene-storage.mjs';
+import {
+    cleanText,
+    latestVersion,
+    loadVersion,
+    MAX_VERSION_DESCRIPTION,
+    MAX_VERSION_NAME,
+    saveVersion,
+    sceneOfKey
+} from './scene-versions.mjs';
 import {
     issueTicket,
     markClosed,
@@ -133,6 +159,14 @@ const RECONNECT_WINDOW =
 // is promoted automatically
 const ADMIN_GRACE_SECONDS =
     Number(process.env.ADMIN_GRACE_SECONDS) || 60;
+
+// Minutes between autosaves while something changed
+// (0 = no timed autosave; the session end still saves)
+const AUTOSAVE_MINUTES =
+    Number(process.env.AUTOSAVE_MINUTES ?? 5);
+
+// Seconds between two saves by hand in one session
+const SAVE_COOLDOWN_SECONDS = 3;
 
 // Client-made ids (crypto.randomUUID or similar)
 const ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
@@ -164,7 +198,7 @@ export class ModelRoom extends Room {
     maxClients = 50;
 
 
-    onCreate(options) {
+    async onCreate(options) {
 
         const sessionKey = String(options?.sessionKey ?? '');
 
@@ -172,12 +206,34 @@ export class ModelRoom extends Room {
             throw new ServerError(400, 'Invalid session key');
         }
 
+        // A saved session behind this link? Then this
+        // room re-opens it (only its owner may, onAuth).
+        let saved = null;
+
+        try {
+            saved = await sceneOfKey(sessionKey);
+        } catch (error) {
+            console.error(`Could not read saved sessions: ${error.message}`);
+        }
+
         // Throws if the key is already in use
-        registerSession(sessionKey, this);
+        registerSession(sessionKey, this, { reopen: !!saved });
 
         this.sessionKey = sessionKey;
 
-        this.sessionType = sessionTypeOf(options?.sessionType);
+        // Saved session record (scene-versions.mjs), null
+        // until the session is saved for the first time
+        this.scene = saved;
+
+        this.sessionType = saved ? sessionTypeOf(saved.sessionType) : sessionTypeOf(options?.sessionType);
+
+        this.sessionName = saved
+            ? saved.name
+            : cleanText(options?.sessionName, 80) || 'Untitled session';
+
+        // The creator owns the session for good, whoever
+        // is admin later
+        this.owner = saved ? saved.owner : null;
 
         this.limits = SESSION_TYPES[this.sessionType];
 
@@ -187,9 +243,19 @@ export class ModelRoom extends Room {
         // Where this session's model files are stored.
         // Random and long: knowing it gives access to the
         // files (see assets.mjs).
-        this.sceneId = SCENE_ID_PATTERN.test(String(options?.sceneId ?? ''))
-            ? options.sceneId
-            : randomBytes(22).toString('base64url');
+        // (A client re-creating its room after a server
+        // restart passes the sceneId it had, so its files
+        // are found again.)
+        this.sceneId = saved
+            ? saved.sceneId
+            : SCENE_ID_PATTERN.test(String(options?.sceneId ?? ''))
+                ? options.sceneId
+                : randomBytes(22).toString('base64url');
+
+        // Public address of this server, for model links
+        this.baseUrl = process.env.PUBLIC_BASE_URL
+            ? process.env.PUBLIC_BASE_URL.replace(/\/+$/, '')
+            : null;
 
         // assetId -> { size, url }: files uploaded for this
         // session, the only ones object:add may use
@@ -229,17 +295,36 @@ export class ModelRoom extends Room {
         // When the last online admin went away (ms)
         this.noAdminSince = null;
 
+        // Saving: changes since the last save, a save
+        // running, when the last save by hand was
+        this.dirty = false;
+        this.changeCount = 0;
+        this.saving = false;
+        this.lastManualSave = 0;
+        this.saveError = null;
+
+
+        // A saved session starts from its newest version
+        if (saved) {
+            await this.loadObjects(await latestVersion(saved));
+        }
+
 
         this.registerObjectMessages();
         this.registerAdminMessages();
         this.registerSessionMessages();
+        this.registerSceneMessages();
 
 
         this.clock.setInterval(() => this.adminWatchdog(), 5000);
 
+        if (AUTOSAVE_MINUTES > 0) {
+            this.clock.setInterval(() => this.autosave(), AUTOSAVE_MINUTES * 60 * 1000);
+        }
+
 
         console.log(
-            `[${this.roomId}] ${this.sessionType} session ${sessionKey} created ` +
+            `[${this.roomId}] ${this.sessionType} session ${sessionKey} ${saved ? 're-opened' : 'created'} ` +
             `(${this.limits.people} people, ${mb(this.limits.maxBytes)} MB of models)`
         );
     }
@@ -268,6 +353,14 @@ export class ModelRoom extends Room {
 
         if (this.banned.has(identity.userId)) {
             throw new ServerError(403, 'You were removed from this session');
+        }
+
+        // Only the owner opens a saved session again
+        if (this.scene && !this.hasCreator && identity.userId !== this.owner.userId) {
+            throw new ServerError(
+                403,
+                `This session is closed. Only its owner (${this.owner.name}) can open it again.`
+            );
         }
 
         // A new person (not a second browser of someone
@@ -316,8 +409,17 @@ export class ModelRoom extends Room {
 
                 this.hasCreator = true;
 
+                this.owner = this.owner || { userId, name };
+
                 user.status = 'approved';
                 user.role = 'admin';
+
+            } else if (this.scene?.attendees?.[userId]?.role) {
+
+                // Was in this saved session before: back in
+                // with the same role, no waiting
+                user.status = 'approved';
+                user.role = this.scene.attendees[userId].role;
 
             } else if (email && this.invites.has(email)) {
 
@@ -473,7 +575,7 @@ export class ModelRoom extends Room {
     }
 
 
-    onDispose() {
+    async onDispose() {
 
         // onCreate refused the key
         if (!this.sessionKey) {
@@ -481,6 +583,11 @@ export class ModelRoom extends Room {
         }
 
         unregisterSession(this.sessionKey, this);
+
+        // Keep the last state of the session
+        if (this.dirty) {
+            await this.save({ auto: true, name: 'Session end' }, null);
+        }
 
         console.log(`[${this.roomId}] session ${this.sessionKey} ended`);
     }
@@ -503,7 +610,13 @@ export class ModelRoom extends Room {
 
     registerObjectMessages() {
 
-        this.onApproved('object:add', (client, user, data) => {
+        this.onApproved('object:add', async (client, user, data) => {
+
+            // A file of this scene from before a server
+            // restart or a restore: look it up in storage
+            if (isValidFileObject(data) && !this.uploads.has(data.assetId)) {
+                await this.findStoredAsset(data.assetId);
+            }
 
             const isFile = isValidFileObject(data) && this.uploads.has(data.assetId);
 
@@ -583,6 +696,8 @@ export class ModelRoom extends Room {
 
             this.totalBytes += added - freed;
 
+            this.markDirty();
+
 
             console.log(
                 `[${this.roomId}] add "${object.name}" ` +
@@ -635,6 +750,8 @@ export class ModelRoom extends Room {
 
             object.transform = pickTransform(data);
 
+            this.markDirty();
+
             this.sendApproved(
                 'object:transform',
                 { id: object.id, ...object.transform },
@@ -667,6 +784,8 @@ export class ModelRoom extends Room {
             if (object.dataUrl) {
                 this.totalBytes -= object.dataUrl.length;
             }
+
+            this.markDirty();
 
 
             console.log(
@@ -866,6 +985,8 @@ export class ModelRoom extends Room {
 
             object.assignedTo = user.userId;
 
+            this.markDirty();
+
             this.fixLocks();
 
             this.sendState();
@@ -882,6 +1003,8 @@ export class ModelRoom extends Room {
 
 
             object.assignedTo = null;
+
+            this.markDirty();
 
             this.fixLocks();
 
@@ -900,6 +1023,8 @@ export class ModelRoom extends Room {
 
 
             [a.assignedTo, b.assignedTo] = [b.assignedTo, a.assignedTo];
+
+            this.markDirty();
 
             this.fixLocks();
 
@@ -1315,6 +1440,331 @@ export class ModelRoom extends Room {
     registerUpload(assetId, size, url) {
 
         this.uploads.set(assetId, { size, url });
+
+        // Remember this server's public address for model
+        // links made later (restore, older clients' models)
+        if (!this.baseUrl) {
+            this.baseUrl = url.slice(0, url.indexOf('/assets/'));
+        }
+    }
+
+
+    assetUrl(assetId) {
+
+        return this.baseUrl ? `${this.baseUrl}/assets/${this.sceneId}/${assetId}.glb` : null;
+    }
+
+
+    // A file of this scene already in storage (after a
+    // server restart, or used by a saved version)
+    async findStoredAsset(assetId) {
+
+        try {
+
+            const size = await getSceneStorage().sizeOf(blobKey(this.sceneId, assetId));
+
+            if (size !== null && !this.uploads.has(assetId)) {
+                this.uploads.set(assetId, { size, url: this.assetUrl(assetId) });
+            }
+
+        } catch (error) {
+            console.error(`[${this.roomId}] storage lookup failed: ${error.message}`);
+        }
+    }
+
+
+    // ==============================================
+    // SAVING AND VERSIONS
+    // ==============================================
+
+    registerSceneMessages() {
+
+        // Save a named version: admins and editors
+        this.onApproved('scene:save', async (client, user, data) => {
+
+            if (user.role !== 'admin' && user.role !== 'editor') {
+                return this.actionDenied(client, 'scene:save', 'Only admins and editors can save');
+            }
+
+            const name = cleanText(data?.name, MAX_VERSION_NAME);
+
+            if (!name) {
+                return this.actionDenied(client, 'scene:save', 'Give the version a name');
+            }
+
+            if (Date.now() - this.lastManualSave < SAVE_COOLDOWN_SECONDS * 1000) {
+                return this.actionDenied(client, 'scene:save', 'Saved a moment ago - try again in a few seconds');
+            }
+
+            this.lastManualSave = Date.now();
+
+            const version = await this.save({
+                name,
+                description: cleanText(data?.description, MAX_VERSION_DESCRIPTION),
+                auto: false
+            }, user);
+
+            if (!version) {
+                this.actionDenied(client, 'scene:save', this.saveError || 'Saving failed, please try again');
+            }
+        });
+
+
+        // Version list: everyone who is in
+        this.onApproved('scene:versions', (client) => {
+
+            client.send('scene:versions', {
+                versions: [...(this.scene?.versions || [])].reverse()
+            });
+        });
+
+
+        // Restore a version: admins only
+        this.onAdmin('scene:restore', async (client, admin, data) => {
+
+            const reason = await this.restore(admin, data?.versionId);
+
+            if (reason) {
+                this.actionDenied(client, 'scene:restore', reason);
+            }
+        });
+    }
+
+
+    markDirty() {
+
+        this.changeCount++;
+
+        // Clients show "unsaved changes" from the state
+        if (!this.dirty) {
+            this.dirty = true;
+            this.sendState();
+        }
+    }
+
+
+    autosave() {
+
+        if (this.dirty && !this.saving && !this.closed) {
+            this.save({ auto: true, name: 'Autosave' }, null);
+        }
+    }
+
+
+    /*
+     * Save the objects as a new version. byUser is null
+     * for autosaves. Returns the version summary, or null
+     * (reason in this.saveError).
+     */
+    async save(version, byUser) {
+
+        // Nothing to keep in a session that never had a model
+        if (!this.scene && this.objects.size === 0) {
+            this.dirty = false;
+            return null;
+        }
+
+        const changesAtStart = this.changeCount;
+
+        this.saving = true;
+        this.sendState();
+
+        try {
+
+            const attendees = {};
+
+            for (const u of this.users.values()) {
+
+                if (u.status === 'approved') {
+                    attendees[u.userId] = { name: u.name, role: u.role, lastSeen: new Date().toISOString() };
+                }
+            }
+
+            const { scene, version: summary } = await saveVersion(
+                {
+                    sceneId: this.sceneId,
+                    sessionKey: this.sessionKey,
+                    name: this.sessionName,
+                    sessionType: this.sessionType,
+                    owner: this.owner,
+                    attendees,
+                    removed: [...this.banned],
+                    baseUrl: this.baseUrl
+                },
+                [...this.objects.values()],
+                {
+                    ...version,
+                    savedBy: byUser
+                        ? { userId: byUser.userId, name: byUser.name }
+                        : { userId: null, name: 'Autosave' }
+                }
+            );
+
+            this.scene = scene;
+
+            this.saveError = null;
+
+            if (this.changeCount === changesAtStart) {
+                this.dirty = false;
+            }
+
+            console.log(
+                `[${this.roomId}] saved "${summary.name}" (${summary.objectCount} models, ` +
+                `${mb(summary.bytes)} MB) by ${summary.savedBy.name}`
+            );
+
+            if (!this.closed) {
+                this.sendApproved('scene:saved', { version: summary });
+            }
+
+            return summary;
+
+        } catch (error) {
+
+            this.saveError = error.userMessage || 'Saving failed, please try again';
+
+            console.error(`[${this.roomId}] save failed: ${error.message}`);
+
+            if (!this.closed) {
+                for (const admin of this.onlineUsers('admin')) {
+                    this.sendToUser(admin, 'session:notice', { text: this.saveError });
+                }
+            }
+
+            return null;
+
+        } finally {
+
+            this.saving = false;
+
+            if (!this.closed) {
+                this.sendState();
+            }
+        }
+    }
+
+
+    // Objects of a saved version -> this.objects (on
+    // re-open). Returns the new map; nothing is sent.
+    async loadObjects(manifest) {
+
+        const objects = new Map();
+
+        for (const o of manifest?.objects || []) {
+
+            if (!isValidId(o.id) || !ASSET_ID_PATTERN.test(String(o.assetId))) {
+                continue;
+            }
+
+            const url = o.url || this.assetUrl(o.assetId);
+
+            this.uploads.set(o.assetId, { size: o.size, url });
+
+            objects.set(o.id, {
+                id: o.id,
+                name: o.name,
+                assetId: o.assetId,
+                size: o.size,
+                url,
+                transform: isValidTransform(o.transform) ? pickTransform(o.transform) : null,
+                addedBy: o.addedBy ?? null,
+                // Kept: people come back with the same id
+                // (an admin can unassign)
+                assignedTo: o.assignedTo ?? null,
+                heldBy: null
+            });
+        }
+
+        this.objects = objects;
+        this.totalBytes = 0;
+
+        return objects;
+    }
+
+
+    /*
+     * Put a saved version back for everyone. The current
+     * state is saved first ("Before restore"), so a
+     * restore can itself be undone. Returns null, or why
+     * it was refused.
+     */
+    async restore(admin, versionId) {
+
+        if (!this.scene) {
+            return 'This session has no saved versions yet';
+        }
+
+        if (!this.scene.versions.some((v) => v.id === versionId)) {
+            return 'Unknown version';
+        }
+
+        const manifest = await loadVersion(this.sceneId, versionId);
+
+        if (!manifest) {
+            return 'That version could not be read';
+        }
+
+
+        if (this.dirty) {
+            await this.save({
+                auto: true,
+                name: 'Before restore',
+                description: `Saved automatically before ${admin.name} restored "${manifest.name}"`
+            }, admin);
+        }
+
+
+        const before = this.objects;
+
+        const after = await this.loadObjects(manifest);
+
+
+        // Tell everyone with the normal object messages
+        for (const old of before.values()) {
+
+            const next = after.get(old.id);
+
+            if (!next || next.assetId !== old.assetId) {
+                this.sendApproved('object:remove', { id: old.id });
+            }
+        }
+
+        for (const next of after.values()) {
+
+            const old = before.get(next.id);
+
+            if (old && old.assetId === next.assetId) {
+
+                if (next.transform) {
+                    this.sendApproved('object:transform', { id: next.id, ...next.transform });
+                }
+
+            } else {
+                this.sendApproved('object:add', next);
+            }
+        }
+
+
+        this.dirty = false;
+
+        console.log(`[${this.roomId}] ${admin.name} restored "${manifest.name}"`);
+
+        this.sendApproved('scene:restored', {
+            version: this.scene.versions.find((v) => v.id === versionId),
+            by: admin.name
+        });
+
+        for (const user of this.onlineUsers()) {
+            if (user.status === 'approved') {
+                this.sendToUser(user, 'session:notice', {
+                    text: `${admin.name} restored the version "${manifest.name}"`
+                });
+            }
+        }
+
+        this.sendState();
+
+        return null;
     }
 
 
@@ -1409,7 +1859,7 @@ export class ModelRoom extends Room {
 
 
         if (user.status !== 'approved') {
-            return { sessionKey: this.sessionKey, you };
+            return { sessionKey: this.sessionKey, sessionName: this.sessionName, you };
         }
 
 
@@ -1465,6 +1915,11 @@ export class ModelRoom extends Room {
             // costs are counted by), for admins
             connections: isAdmin ? this.clients.length : undefined,
             sessionType: this.sessionType,
+            sessionName: this.sessionName,
+            // The creator, for good (admin can move to
+            // others, ownership never does)
+            owner: this.owner,
+            scene: this.sceneStateFor(isAdmin),
             limits: {
                 people: this.limits.people,
                 maxBytes: this.limits.maxBytes,
@@ -1474,8 +1929,29 @@ export class ModelRoom extends Room {
             features: {
                 emailInvites: isAdmin && mailerReady(),
                 // POST /assets + object:add { assetId }
-                assetUploads: true
+                assetUploads: true,
+                // scene:save / scene:versions / scene:restore
+                versions: true
             }
+        };
+    }
+
+
+    sceneStateFor(isAdmin) {
+
+        const versions = this.scene?.versions || [];
+
+        const latest = versions[versions.length - 1] || null;
+
+        return {
+            saved: !!this.scene,
+            // Admins only (it names the storage folder)
+            sceneId: isAdmin ? this.sceneId : undefined,
+            dirty: this.dirty,
+            saving: this.saving,
+            versionCount: versions.length,
+            latest,
+            error: this.saveError
         };
     }
 
@@ -1611,7 +2087,9 @@ export class ModelRoom extends Room {
                 return;
             }
 
-            handler(client, user, data);
+            Promise.resolve(handler(client, user, data)).catch((error) => {
+                console.error(`[${this.roomId}] ${type} failed:`, error);
+            });
         });
     }
 

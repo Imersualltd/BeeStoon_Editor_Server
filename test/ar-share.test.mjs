@@ -90,6 +90,8 @@ const server = spawn(process.execPath, ['src/index.mjs'], {
         ALLOW_DEV_AUTH: 'true',
         AR_STORAGE: 'local',
         AR_LOCAL_DIR: storeDir,
+        SCENE_STORAGE: 'local',
+        SCENE_LOCAL_DIR: path.join(storeDir, 'scenes'),
         // about 2 seconds
         AR_LINK_HOURS: String(2 / 3600)
     },

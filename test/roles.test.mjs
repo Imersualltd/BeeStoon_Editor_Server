@@ -11,6 +11,9 @@
  */
 
 import { spawn } from 'node:child_process';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import assert from 'node:assert/strict';
 
@@ -143,7 +146,10 @@ const server = spawn(process.execPath, ['src/index.mjs'], {
         ADMIN_GRACE_SECONDS: '2',
         RECONNECT_WINDOW: '1',
         // Invite emails go to the server log
-        MAIL_PROVIDER: 'log'
+        MAIL_PROVIDER: 'log',
+        // Saved sessions of this run only
+        SCENE_STORAGE: 'local',
+        SCENE_LOCAL_DIR: mkdtempSync(path.join(tmpdir(), 'be-water-roles-test-'))
     },
     stdio: ['ignore', 'pipe', 'pipe']
 });
@@ -412,9 +418,12 @@ async function main() {
     await sleep(300);
     await rejects(connect('Eve', KEY), 'join closed session');
     const recreate = await connect('Eve', KEY, 'create').then(() => null, (e) => e);
-    check('closed session link no longer works, not even re-created (410)', () => {
+    // It had models, so it was saved when it closed:
+    // only its owner (Ada) may open it again
+    check('closed session cannot be re-created by someone else (403, owner only)', () => {
         assert.ok(recreate, 're-create must fail');
-        assert.equal(recreate.code, 410);
+        assert.equal(recreate.code, 403);
+        assert.match(recreate.message, /Only its owner \(Ada\)/);
     });
 
 
