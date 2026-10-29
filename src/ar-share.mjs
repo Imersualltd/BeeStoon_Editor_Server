@@ -249,7 +249,7 @@ async function sweepExpired(storage) {
 }
 
 
-function baseUrl(req) {
+export function baseUrl(req) {
 
     if (process.env.PUBLIC_BASE_URL) {
         return process.env.PUBLIC_BASE_URL.replace(/\/+$/, '');

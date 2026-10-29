@@ -23,7 +23,10 @@
  * Messages
  *
  *   client -> server (approved users)
- *     'object:add'        { id, name, dataUrl, transform? }
+ *     'object:add'        { id, name, assetId, transform? }
+ *                         (assetId from POST /assets, see assets.mjs;
+ *                         older clients send { dataUrl } instead,
+ *                         which is still kept in memory)
  *     'object:transform'  { id, position, rotation, scale }
  *     'object:remove'     { id }
  *     'object:hold'       { id }
@@ -66,7 +69,8 @@
  *     'session:notice'    { text }
  *     'session:closed'    { by }
  *     'object:list'       { serverId, ids: [id, ...] }
- *     'object:add'        { id, name, dataUrl, transform, ... }
+ *     'object:add'        { id, name, assetId, size, url, transform, ... }
+ *                         (or dataUrl for a model from an older client)
  *     'object:transform'  { id, position, rotation, scale }
  *     'object:remove'     { id }
  *     'object:rejected'   { id, reason }   (room memory full)
@@ -84,17 +88,24 @@
  * object the client does not have yet, then poses.
  * serverId changes on every server start.
  *
- * The room memory limit (MAX_ROOM_MB, default 250 MB)
- * is unchanged. Everything lives in memory: the room
- * and its objects are gone when the last person leaves.
+ * Session type (create option sessionType: single,
+ * basic, workshop; see session-types.mjs) limits the
+ * number of people, the size of one model file and of
+ * all model files together. The memory limit
+ * (MAX_ROOM_MB, default 250 MB) now only applies to
+ * models from older clients sent as data URLs. The room
+ * itself still lives in memory and is gone when the
+ * last person leaves; model files are in storage.
  */
 
-import { randomUUID } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import { Room, ServerError } from 'colyseus';
 
 import { getAuthAdapter } from './auth/index.mjs';
 import { cleanEmail } from './auth/util.mjs';
 import { mailerReady, sendInvite } from './mailer.mjs';
+import { ASSET_ID_PATTERN, SCENE_ID_PATTERN } from './assets.mjs';
+import { SESSION_TYPES, sessionTypeOf } from './session-types.mjs';
 import {
     issueTicket,
     markClosed,
@@ -166,6 +177,24 @@ export class ModelRoom extends Room {
 
         this.sessionKey = sessionKey;
 
+        this.sessionType = sessionTypeOf(options?.sessionType);
+
+        this.limits = SESSION_TYPES[this.sessionType];
+
+        // Several browsers per person
+        this.maxClients = Math.min(200, this.limits.people * 4);
+
+        // Where this session's model files are stored.
+        // Random and long: knowing it gives access to the
+        // files (see assets.mjs).
+        this.sceneId = SCENE_ID_PATTERN.test(String(options?.sceneId ?? ''))
+            ? options.sceneId
+            : randomBytes(22).toString('base64url');
+
+        // assetId -> { size, url }: files uploaded for this
+        // session, the only ones object:add may use
+        this.uploads = new Map();
+
         // userId -> { userId, name, email, role, status,
         //             joinedAt, online, clients, dropped }
         // status: 'pending' | 'approved'
@@ -183,11 +212,14 @@ export class ModelRoom extends Room {
         // Kicked users cannot come back
         this.banned = new Set();
 
-        // id -> { id, name, dataUrl, transform,
+        // id -> { id, name, assetId, size, url, transform,
         //         addedBy, assignedTo, heldBy }
+        // (dataUrl instead of assetId/size/url for a model
+        // from an older client)
         // Map keeps insertion order = import order.
         this.objects = new Map();
 
+        // Memory used by data URL models (older clients)
         this.totalBytes = 0;
 
         this.hasCreator = false;
@@ -207,8 +239,8 @@ export class ModelRoom extends Room {
 
 
         console.log(
-            `[${this.roomId}] session ${sessionKey} created ` +
-            `(memory limit ${Math.round(MAX_ROOM_BYTES / 1024 / 1024)} MB)`
+            `[${this.roomId}] ${this.sessionType} session ${sessionKey} created ` +
+            `(${this.limits.people} people, ${mb(this.limits.maxBytes)} MB of models)`
         );
     }
 
@@ -236,6 +268,15 @@ export class ModelRoom extends Room {
 
         if (this.banned.has(identity.userId)) {
             throw new ServerError(403, 'You were removed from this session');
+        }
+
+        // A new person (not a second browser of someone
+        // already here) needs a free place
+        if (!this.users.has(identity.userId) && this.users.size >= this.limits.people) {
+            throw new ServerError(
+                403,
+                `This session is full (${this.limits.people} ${this.limits.people === 1 ? 'person' : 'people'})`
+            );
         }
 
         return identity;
@@ -464,7 +505,9 @@ export class ModelRoom extends Room {
 
         this.onApproved('object:add', (client, user, data) => {
 
-            if (!isValidAsset(data)) {
+            const isFile = isValidFileObject(data) && this.uploads.has(data.assetId);
+
+            if (!isFile && !isValidAsset(data)) {
 
                 console.warn(`[${this.roomId}] rejected object from ${user.name}`);
 
@@ -484,9 +527,32 @@ export class ModelRoom extends Room {
             }
 
 
-            const freed = previous ? previous.dataUrl.length : 0;
+            const freed = previous?.dataUrl ? previous.dataUrl.length : 0;
 
-            if (this.totalBytes - freed + data.dataUrl.length > MAX_ROOM_BYTES) {
+            const added = isFile ? 0 : data.dataUrl.length;
+
+            const upload = isFile ? this.uploads.get(data.assetId) : null;
+
+
+            // Session type limit, all models together
+            const used = this.usedBytes(data.id) + (
+                isFile
+                    ? (this.usesAsset(data.assetId, data.id) ? 0 : upload.size)
+                    : dataUrlBytes(data.dataUrl)
+            );
+
+            if (used > this.limits.maxBytes) {
+
+                client.send('object:rejected', {
+                    id: data.id,
+                    reason: `The session is full (${mb(this.limits.maxBytes)} MB of models for a ${this.limits.label} session) - this model stays only on your screen`
+                });
+
+                return;
+            }
+
+
+            if (this.totalBytes - freed + added > MAX_ROOM_BYTES) {
 
                 console.warn(`[${this.roomId}] room is full, rejected "${data.name}"`);
 
@@ -502,7 +568,9 @@ export class ModelRoom extends Room {
             const object = {
                 id: data.id,
                 name: data.name,
-                dataUrl: data.dataUrl,
+                ...(isFile
+                    ? { assetId: data.assetId, size: upload.size, url: upload.url }
+                    : { dataUrl: data.dataUrl }),
                 transform: isValidTransform(data.transform)
                     ? pickTransform(data.transform)
                     : null,
@@ -513,14 +581,15 @@ export class ModelRoom extends Room {
 
             this.objects.set(object.id, object);
 
-            this.totalBytes += object.dataUrl.length - freed;
+            this.totalBytes += added - freed;
 
 
             console.log(
                 `[${this.roomId}] add "${object.name}" ` +
-                `(${Math.round(object.dataUrl.length / 1024)} KB) ` +
+                `(${Math.round((isFile ? object.size : dataUrlBytes(object.dataUrl)) / 1024)} KB` +
+                `${isFile ? '' : ', data URL'}) ` +
                 `by ${user.name} - ${this.objects.size} objects, ` +
-                `${Math.round(this.totalBytes / 1024 / 1024)} MB`
+                `${mb(this.usedBytes())} of ${mb(this.limits.maxBytes)} MB`
             );
 
 
@@ -595,7 +664,9 @@ export class ModelRoom extends Room {
 
             this.objects.delete(object.id);
 
-            this.totalBytes -= object.dataUrl.length;
+            if (object.dataUrl) {
+                this.totalBytes -= object.dataUrl.length;
+            }
 
 
             console.log(
@@ -1178,6 +1249,76 @@ export class ModelRoom extends Room {
 
 
     // ==============================================
+    // MODEL FILES AND LIMITS
+    // ==============================================
+
+    // Bytes of all models in the session; a file used
+    // by several objects counts once. exceptId leaves
+    // one object out (the one being replaced).
+    usedBytes(exceptId) {
+
+        const files = new Map();
+
+        let total = 0;
+
+        for (const object of this.objects.values()) {
+
+            if (object.id === exceptId) {
+                continue;
+            }
+
+            if (object.assetId) {
+                files.set(object.assetId, object.size);
+            } else if (object.dataUrl) {
+                total += dataUrlBytes(object.dataUrl);
+            }
+        }
+
+        for (const size of files.values()) {
+            total += size;
+        }
+
+        return total;
+    }
+
+
+    usesAsset(assetId, exceptId) {
+
+        for (const object of this.objects.values()) {
+
+            if (object.id !== exceptId && object.assetId === assetId) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+
+    // Used by POST /assets: null, or why the file is refused
+    uploadDenial(assetId, size) {
+
+        if (size > this.limits.fileBytes) {
+            return `This model is ${mb(size)} MB; a ${this.limits.label} session allows ` +
+                `${mb(this.limits.fileBytes)} MB per file`;
+        }
+
+        if (!this.usesAsset(assetId) && this.usedBytes() + size > this.limits.maxBytes) {
+            return `The session is full: ${mb(this.usedBytes())} of ${mb(this.limits.maxBytes)} MB ` +
+                `of models used (${this.limits.label} session)`;
+        }
+
+        return null;
+    }
+
+
+    registerUpload(assetId, size, url) {
+
+        this.uploads.set(assetId, { size, url });
+    }
+
+
+    // ==============================================
     // PERMISSIONS
     // ==============================================
 
@@ -1323,7 +1464,18 @@ export class ModelRoom extends Room {
             // Open connections in total (what hosting
             // costs are counted by), for admins
             connections: isAdmin ? this.clients.length : undefined,
-            features: { emailInvites: isAdmin && mailerReady() }
+            sessionType: this.sessionType,
+            limits: {
+                people: this.limits.people,
+                maxBytes: this.limits.maxBytes,
+                fileBytes: this.limits.fileBytes
+            },
+            usedBytes: this.usedBytes(),
+            features: {
+                emailInvites: isAdmin && mailerReady(),
+                // POST /assets + object:add { assetId }
+                assetUploads: true
+            }
         };
     }
 
@@ -1501,6 +1653,35 @@ function isValidAsset(data) {
         data.dataUrl.startsWith('data:') &&
         data.dataUrl.length <= MAX_DATA_URL_LENGTH
     );
+}
+
+
+function isValidFileObject(data) {
+
+    return (
+        data &&
+        isValidId(data.id) &&
+        typeof data.name === 'string' &&
+        data.name.length > 0 &&
+        data.name.length <= 200 &&
+        typeof data.assetId === 'string' &&
+        ASSET_ID_PATTERN.test(data.assetId)
+    );
+}
+
+
+// A base64 data URL holds about 3 bytes per 4 characters
+function dataUrlBytes(dataUrl) {
+
+    const comma = dataUrl.indexOf(',');
+
+    return Math.floor((dataUrl.length - comma - 1) * 3 / 4);
+}
+
+
+function mb(bytes) {
+
+    return Math.round(bytes / 1024 / 1024);
 }
 
 

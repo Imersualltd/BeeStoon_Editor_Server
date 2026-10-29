@@ -13,6 +13,7 @@ import { getAuthAdapter } from './auth/index.mjs';
 import { registerConvertRoute } from './convert.mjs';
 import { registerExportFbxRoute } from './export-fbx.mjs';
 import { registerArShareRoutes } from './ar-share.mjs';
+import { registerAssetRoutes } from './assets.mjs';
 
 
 const PORT = Number(process.env.PORT) || 2567;
@@ -73,6 +74,9 @@ const server = defineServer({
 
         // POST /ar/snapshots, GET /ar/<id> : AR share links (see ar-share.mjs)
         registerArShareRoutes(app);
+
+        // POST /assets, GET /assets/<scene>/<id>.glb : model files (see assets.mjs)
+        registerAssetRoutes(app);
     }
 });
 
