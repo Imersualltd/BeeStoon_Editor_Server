@@ -1909,7 +1909,7 @@ export class ModelRoom extends Room {
         await this.save({
             auto: true,
             name: `Restored "${manifest.name}"`.slice(0, 80),
-            description: `${admin.name} restored the version "${manifest.name}" from ${manifest.createdAt}`
+            description: `${admin.name} restored the version "${manifest.name}"`
         }, admin);
 
         this.sendApproved('scene:restored', {
