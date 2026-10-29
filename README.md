@@ -1,4 +1,4 @@
-# BE WATER – Multiplayer Server
+# BeeStoon Editor Server
 
 سرور Colyseus برای اشتراک‌گذاری چند آبجکت GLB (هر کدام با transform خودش) بین کاربران.
 با کلاینت `network-manager.mjs` در پروژهٔ PlayCanvas کار می‌کند.
@@ -27,7 +27,7 @@ npm test
   چون خروجی FBX به ابزار `assimp` نیاز دارد که در Docker image نصب می‌شود.
 - Health check: `/health`
 
-بعد از استقرار، آدرس HTTPS سرویس (مثلاً `https://be-water.onrender.com`)
+بعد از استقرار، آدرس HTTPS سرویس (مثلاً `https://editor-server.your-domain.com`)
 را در attribute **Server Url** روی entity `NetworkManager` بگذارید.
 
 ## محدودیت‌ها

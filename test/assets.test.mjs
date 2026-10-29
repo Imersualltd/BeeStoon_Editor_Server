@@ -138,7 +138,7 @@ const POSE = { position: [1, 2, 3], rotation: [0, 0, 0], scale: [1, 1, 1] };
 // SERVER
 // ==================================================
 
-const storageDir = await mkdtemp(path.join(tmpdir(), 'be-water-assets-test-'));
+const storageDir = await mkdtemp(path.join(tmpdir(), 'beestoon-editor-assets-test-'));
 
 const server = spawn(process.execPath, ['src/index.mjs'], {
     env: {

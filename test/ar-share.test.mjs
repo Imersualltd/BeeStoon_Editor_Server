@@ -80,7 +80,7 @@ async function upload(body, ticket) {
 // SERVER
 // ==================================================
 
-const storeDir = await mkdtemp(path.join(tmpdir(), 'be-water-ar-test-'));
+const storeDir = await mkdtemp(path.join(tmpdir(), 'beestoon-editor-ar-test-'));
 
 const server = spawn(process.execPath, ['src/index.mjs'], {
     env: {

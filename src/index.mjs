@@ -1,5 +1,5 @@
 /*
- * BE WATER - multiplayer server entry point
+ * BeeStoon Editor Server - multiplayer server entry point
  * --------------------------------------------------
  * Runs anywhere Node 22+ runs (Render, Railway,
  * Liara, a VPS ...). The host decides the port
@@ -68,7 +68,7 @@ const server = defineServer({
         app.get('/', (req, res) => {
             res.json({
                 ok: true,
-                service: 'be-water-multiplayer',
+                service: 'beestoon-editor-server',
                 time: new Date().toISOString()
             });
         });

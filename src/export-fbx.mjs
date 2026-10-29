@@ -140,7 +140,7 @@ async function handleExport(req, res) {
     busy = true;
 
 
-    const workDir = path.join(tmpdir(), `be-water-fbx-${randomUUID()}`);
+    const workDir = path.join(tmpdir(), `beestoon-editor-fbx-${randomUUID()}`);
     const started = Date.now();
 
 

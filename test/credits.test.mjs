@@ -199,7 +199,7 @@ async function api(method, userId, name, pathname) {
 
 const wallet = async (name) => (await api('GET', name.toLowerCase(), name, '/credits/mine')).json;
 
-const storageDir = await mkdtemp(path.join(tmpdir(), 'be-water-credits-test-'));
+const storageDir = await mkdtemp(path.join(tmpdir(), 'beestoon-editor-credits-test-'));
 
 const server = spawn(process.execPath, ['src/index.mjs'], {
     env: {

@@ -8,7 +8,7 @@
  * AR_STORAGE picks where they live:
  *
  *   local (default)  a folder on this machine
- *                    (AR_LOCAL_DIR, default <tmp>/be-water-ar).
+ *                    (AR_LOCAL_DIR, default <tmp>/beestoon-editor-ar).
  *                    Fine for development and Render's free
  *                    plan, but the folder is wiped on every
  *                    redeploy.
@@ -65,7 +65,7 @@ export function getArStorage() {
 
 function createLocalStorage() {
 
-    const root = process.env.AR_LOCAL_DIR || path.join(tmpdir(), 'be-water-ar');
+    const root = process.env.AR_LOCAL_DIR || path.join(tmpdir(), 'beestoon-editor-ar');
 
     const dirOf = (id) => path.join(root, id);
 

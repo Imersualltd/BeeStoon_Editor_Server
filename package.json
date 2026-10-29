@@ -1,7 +1,7 @@
 {
-  "name": "be-water-multiplayer-server",
+  "name": "beestoon-editor-server",
   "version": "1.0.0",
-  "description": "Colyseus server for the BE WATER PlayCanvas shared-model prototype",
+  "description": "Colyseus server for the BeeStoon Editor (PlayCanvas)",
   "type": "module",
   "main": "src/index.mjs",
   "scripts": {
