@@ -28,7 +28,7 @@
  *                    README).
  *
  * Interface:
- *   put(key, body)  get(key)  exists(key)  list(folderKey)
+ *   put(key, body)  get(key)  exists(key)  sizeOf(key)  list(folderKey)
  *   remove([keys])  signedUrl(key, seconds)  (s3 only, else null)
  */
 
@@ -116,6 +116,14 @@ function createLocalStorage() {
                 return true;
             } catch {
                 return false;
+            }
+        },
+
+        async sizeOf(key) {
+            try {
+                return (await stat(fileOf(key))).size;
+            } catch {
+                return null;
             }
         },
 
@@ -243,6 +251,28 @@ function createS3Storage() {
 
                 if (error?.name === 'NotFound' || error?.$metadata?.httpStatusCode === 404) {
                     return false;
+                }
+
+                throw error;
+            }
+        },
+
+        async sizeOf(key) {
+
+            const { client, s3Module } = await s3();
+
+            try {
+                const head = await client.send(new s3Module.HeadObjectCommand({
+                    Bucket: bucket,
+                    Key: objectKey(key)
+                }));
+
+                return head.ContentLength ?? null;
+
+            } catch (error) {
+
+                if (error?.name === 'NotFound' || error?.$metadata?.httpStatusCode === 404) {
+                    return null;
                 }
 
                 throw error;

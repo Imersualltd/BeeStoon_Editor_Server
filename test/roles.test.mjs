@@ -11,6 +11,9 @@
  */
 
 import { spawn } from 'node:child_process';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import assert from 'node:assert/strict';
 
@@ -143,7 +146,10 @@ const server = spawn(process.execPath, ['src/index.mjs'], {
         ADMIN_GRACE_SECONDS: '2',
         RECONNECT_WINDOW: '1',
         // Invite emails go to the server log
-        MAIL_PROVIDER: 'log'
+        MAIL_PROVIDER: 'log',
+        // Saved sessions of this run only
+        SCENE_STORAGE: 'local',
+        SCENE_LOCAL_DIR: mkdtempSync(path.join(tmpdir(), 'be-water-roles-test-'))
     },
     stdio: ['ignore', 'pipe', 'pipe']
 });
@@ -399,12 +405,23 @@ async function main() {
     await ada2.room.leave();
 
 
-    console.log('\nLast admin leaves -> session closed for everyone');
+    console.log('\nLast admin leaves without choosing -> oldest editor takes over');
 
     await waitFor(() => !userIn(bob, 'Ada')?.online, 'ada offline');
     bob.send('session:leave', { choice: 'keep' });
-    await waitFor(() => eve3.leftCode !== null && bob.leftCode !== null, 'everyone disconnected');
-    check('last admin leaving disconnects everyone with 4103', () => {
+    await waitFor(() => eve3.state.you.role === 'admin', 'eve admin');
+    check('admin goes to the oldest editor, the session goes on', () => {
+        assert.equal(eve3.leftCode, null);
+        assert.ok(eve3.got('session:notice', (n) => /Eve is now admin \(Bob left\)/.test(n.text)));
+    });
+    check('the creator stays the owner', () => assert.equal(eve3.state.owner.name, 'Ada'));
+
+
+    console.log('\nLast admin closes the session -> closed for everyone');
+
+    eve3.send('session:leave', { choice: 'close' });
+    await waitFor(() => eve3.leftCode !== null, 'everyone disconnected');
+    check('closing disconnects everyone with 4103', () => {
         assert.equal(eve3.leftCode, 4103);
         assert.ok(eve3.got('session:closed'));
     });
@@ -412,9 +429,12 @@ async function main() {
     await sleep(300);
     await rejects(connect('Eve', KEY), 'join closed session');
     const recreate = await connect('Eve', KEY, 'create').then(() => null, (e) => e);
-    check('closed session link no longer works, not even re-created (410)', () => {
+    // It had models, so it was saved when it closed:
+    // only its owner (Ada) may open it again
+    check('closed session cannot be re-created by someone else (403, owner only)', () => {
         assert.ok(recreate, 're-create must fail');
-        assert.equal(recreate.code, 410);
+        assert.equal(recreate.code, 403);
+        assert.match(recreate.message, /Only its owner \(Ada\)/);
     });
 
 
@@ -438,8 +458,18 @@ async function main() {
     x.send('join:approve', { userId: 'dev:yan', role: 'editor' });
     await waitFor(() => y.state.you.status === 'approved', 'yan approved');
     await x.room.leave(false);   // like closing the tab
-    await waitFor(() => y.leftCode !== null, 'yan disconnected', 10000);
-    check('session closes once the reconnect window runs out (4103)', () => assert.equal(y.leftCode, 4103));
+    await waitFor(() => y.state.you.role === 'admin', 'yan admin', 10000);
+    check('once the reconnect window runs out, the oldest editor becomes admin', () => {
+        assert.equal(y.leftCode, null);
+        assert.equal(y.state.owner.name, 'Ann');
+    });
+
+    const w = await connect('Wim', KEY2);
+    y.send('join:approve', { userId: 'dev:wim', role: 'viewer' });
+    await waitFor(() => w.state.you.status === 'approved', 'wim approved');
+    await y.room.leave(false);
+    await waitFor(() => w.leftCode !== null, 'wim disconnected', 10000);
+    check('with no editor left, the session closes (4103)', () => assert.equal(w.leftCode, 4103));
     await sleep(300);
     const reopen2 = await connect('Xavi', KEY2, 'create').then(() => null, (e) => e);
     check('its link no longer works (410)', () => assert.equal(reopen2?.code, 410));
