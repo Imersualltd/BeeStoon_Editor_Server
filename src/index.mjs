@@ -14,6 +14,7 @@ import { registerConvertRoute } from './convert.mjs';
 import { registerExportFbxRoute } from './export-fbx.mjs';
 import { registerArShareRoutes } from './ar-share.mjs';
 import { registerAssetRoutes } from './assets.mjs';
+import { registerMySessionsRoutes } from './my-sessions.mjs';
 
 
 const PORT = Number(process.env.PORT) || 2567;
@@ -77,6 +78,9 @@ const server = defineServer({
 
         // POST /assets, GET /assets/<scene>/<id>.glb : model files (see assets.mjs)
         registerAssetRoutes(app);
+
+        // GET /sessions/mine, DELETE /sessions/<key> : My sessions (see my-sessions.mjs)
+        registerMySessionsRoutes(app);
     }
 });
 
