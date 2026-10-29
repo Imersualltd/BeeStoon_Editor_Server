@@ -203,6 +203,29 @@ async function main() {
     await waitFor(() => serverLog.includes('listening'), 'server start', 15000);
 
 
+    console.log('\nNobody else can remove the owner');
+
+    const own = await connect('Olga', 'owner-session-0001', 'create');
+    const pat = await connect('Pat', 'owner-session-0001');
+    await approve(own, pat, 'admin');
+
+    pat.send('user:kick', { userId: 'dev:olga' });
+    await waitFor(() => pat.got('action:denied', (d) => d.type === 'user:kick'), 'kick refused');
+    check('another admin cannot remove the owner', () => {
+        assert.match(last(pat, 'action:denied', (d) => d.type === 'user:kick').reason, /owner/);
+        assert.equal(own.leftCode, null);
+    });
+
+    pat.send('role:set', { userId: 'dev:olga', role: 'viewer' });
+    await waitFor(() => pat.got('action:denied', (d) => d.type === 'role:set'), 'role change refused');
+    check('... or change the owner\'s role', () => {
+        assert.equal(own.state.you.role, 'admin');
+    });
+
+    own.room.leave();
+    pat.room.leave();
+
+
     console.log('\nAdmin takes over an object an editor holds');
 
     const KEY = 'admin-rules-0001';
