@@ -138,6 +138,9 @@ export function requireEditor(req, res, next) {
         return;
     }
 
+    // For routes that need the room (e.g. /assets)
+    req.session = entry;
+
     next();
 }
 
