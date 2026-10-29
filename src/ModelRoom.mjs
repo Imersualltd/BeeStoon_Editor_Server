@@ -33,11 +33,22 @@
  *     'object:release'    { id }
  *     'sync-request'      { have?: [id, ...] }
  *     'session:leave'     { choice?: 'close'|'keep'|'assign', newAdminId? }
- *                         (the last online admin leaving closes
- *                         the session unless they 'assign' admin
- *                         to someone first; so does that admin
- *                         closing the tab and not coming back
- *                         within RECONNECT_WINDOW)
+ *                         (when the last online admin leaves
+ *                         without 'close' or 'assign' - or closes
+ *                         the tab and is not back within
+ *                         RECONNECT_WINDOW, or goes idle - admin
+ *                         passes to the oldest online editor;
+ *                         with no editor the session closes.
+ *                         There is never a session without an
+ *                         admin. The creator stays the owner.)
+ *     'activity'          {}  (every minute or so while the person
+ *                         uses the app; IDLE_MINUTES (60) without
+ *                         any message -> taken out with 4105,
+ *                         warned IDLE_WARNING_MINUTES (5) before)
+ *     'object:hold' by an admin on an object someone else holds
+ *                         sets overrideBy: the holder keeps the
+ *                         lock but cannot move it until the admin
+ *                         sends 'object:release'
  *
  *   One person (same userId, i.e. the same login) may
  *   be connected from several browsers at once. They
@@ -80,6 +91,7 @@
  *     'join:request'      { userId, name }   (admins)
  *     'invite:result'     { sent: [email], failed: [{ email, reason }] }
  *     'session:notice'    { text }
+ *     'session:idle-warning' { secondsLeft }
  *     'session:closed'    { by }
  *     'object:list'       { serverId, ids: [id, ...] }
  *     'object:add'        { id, name, assetId, size, url, transform, ... }
@@ -96,6 +108,7 @@
  *
  * Leave codes the client can show:
  *   4101 kicked, 4102 denied, 4103 session closed,
+ *   4105 taken out after IDLE_MINUTES without activity,
  *   4104 opened in another tab/window (no longer sent:
  *   several browsers are allowed)
  *
@@ -165,6 +178,15 @@ const ADMIN_GRACE_SECONDS =
 const AUTOSAVE_MINUTES =
     Number(process.env.AUTOSAVE_MINUTES ?? 5);
 
+// Minutes without any activity before someone is
+// taken out of the session (admins too), and how long
+// before that they are warned
+const IDLE_MINUTES = Number(process.env.IDLE_MINUTES) || 60;
+const IDLE_WARNING_MINUTES = Math.min(
+    Number(process.env.IDLE_WARNING_MINUTES) || 5,
+    IDLE_MINUTES / 2
+);
+
 // Seconds between two saves by hand in one session
 const SAVE_COOLDOWN_SECONDS = 3;
 
@@ -182,7 +204,8 @@ export const LEAVE_CODES = {
     KICKED: 4101,
     DENIED: 4102,
     CLOSED: 4103,
-    REPLACED: 4104
+    REPLACED: 4104,
+    INACTIVE: 4105
 };
 
 // New for every server start (see header)
@@ -318,6 +341,11 @@ export class ModelRoom extends Room {
 
         this.clock.setInterval(() => this.adminWatchdog(), 5000);
 
+        this.clock.setInterval(
+            () => this.idleWatchdog(),
+            Math.min(5000, IDLE_MINUTES * 60000 / 10)
+        );
+
         if (AUTOSAVE_MINUTES > 0) {
             this.clock.setInterval(() => this.autosave(), AUTOSAVE_MINUTES * 60 * 1000);
         }
@@ -444,6 +472,9 @@ export class ModelRoom extends Room {
 
         user.clients.add(client);
 
+        user.lastActive = Date.now();
+        user.idleWarned = false;
+
         this.refreshOnline(user);
 
 
@@ -547,6 +578,19 @@ export class ModelRoom extends Room {
             return;
         }
 
+        console.log(
+            `[${this.roomId}] leave "${user.name}" ` +
+            `(${this.clients.length} online)`
+        );
+
+        this.afterUserGone(user);
+    }
+
+
+    // Someone has no browser left in the session (left,
+    // tab closed and not back in time, or inactive)
+    afterUserGone(user) {
+
         // Pending people who give up are forgotten
         if (user.status === 'pending') {
             this.users.delete(user.userId);
@@ -555,23 +599,52 @@ export class ModelRoom extends Room {
         this.releaseHoldsOf(user.userId);
 
 
-        console.log(
-            `[${this.roomId}] leave "${user.name}" ` +
-            `(${this.clients.length} online)`
-        );
-
-
-        // The last admin is gone for good (tab closed,
-        // not back in time): the session ends with them
+        // The last admin is gone: admin goes to the
+        // oldest editor; with no editor the session ends
         if (user.role === 'admin' && user.status === 'approved' && this.onlineUsers('admin').length === 0) {
 
-            this.closeSession(user);
+            if (!this.handOverAdmin(user)) {
 
-            return;
+                this.closeSession(user);
+
+                return;
+            }
         }
 
 
         this.sendState();
+    }
+
+
+    /*
+     * Make the oldest online editor admin (when the last
+     * admin went without handing over). Ownership does
+     * not move: the creator stays the owner.
+     * Returns false when there is no editor online.
+     */
+    handOverAdmin(fromUser) {
+
+        const next = this.onlineUsers('editor')
+            .filter((u) => u.status === 'approved' && u !== fromUser)
+            .sort((a, b) => a.joinedAt - b.joinedAt)[0];
+
+        if (!next) {
+            return false;
+        }
+
+        next.role = 'admin';
+
+        this.fixLocks();
+
+        console.log(`[${this.roomId}] admin passed to "${next.name}" (oldest editor)`);
+
+        this.sendApproved('session:notice', {
+            text: fromUser
+                ? `${next.name} is now admin (${fromUser.name} left)`
+                : `${next.name} is now admin (no admin was online)`
+        });
+
+        return true;
     }
 
 
@@ -689,7 +762,8 @@ export class ModelRoom extends Room {
                     : null,
                 addedBy: previous ? previous.addedBy : user.userId,
                 assignedTo: previous ? previous.assignedTo : null,
-                heldBy: previous ? previous.heldBy : null
+                heldBy: previous ? previous.heldBy : null,
+                overrideBy: previous ? previous.overrideBy || null : null
             };
 
             this.objects.set(object.id, object);
@@ -823,7 +897,17 @@ export class ModelRoom extends Room {
             }
 
 
-            object.heldBy = user.userId;
+            // An admin taking an object someone else holds
+            // only borrows it: the lock stays with them,
+            // their moves wait until the admin lets go
+            if (user.role === 'admin' && object.heldBy && object.heldBy !== user.userId) {
+
+                object.overrideBy = user.userId;
+
+            } else {
+
+                object.heldBy = user.userId;
+            }
 
             this.sendState();
         });
@@ -833,7 +917,17 @@ export class ModelRoom extends Room {
 
             const object = isValidId(data?.id) ? this.objects.get(data.id) : null;
 
-            if (object && object.heldBy === user.userId) {
+            if (!object) {
+                return;
+            }
+
+            if (object.overrideBy === user.userId) {
+
+                object.overrideBy = null;
+
+                this.sendState();
+
+            } else if (object.heldBy === user.userId) {
 
                 object.heldBy = null;
 
@@ -1223,11 +1317,26 @@ export class ModelRoom extends Room {
 
     registerSessionMessages() {
 
+        // The client sends this every minute or so while
+        // the person uses mouse, keyboard, touch or VR
+        // controllers (pending people too)
+        this.onMessage('activity', (client) => {
+
+            const user = this.userOf(client);
+
+            if (user?.clients.has(client)) {
+                this.noteActivity(user);
+            }
+        });
+
         /*
          * Leave button. Only matters for the last
          * online admin:
+         *   close  - the session ends for everyone
          *   assign - make newAdminId admin, then leave
-         *   anything else - the session ends for everyone
+         *   anything else - admin goes to the oldest
+         *            editor; with no editor online the
+         *            session ends
          * Everyone else simply leaves.
          */
         this.onApproved('session:leave', (client, user, data) => {
@@ -1252,9 +1361,7 @@ export class ModelRoom extends Room {
                 this.onlineUsers('admin').length <= 1;
 
 
-            // The last admin leaving ends the session (and
-            // its link), unless they hand admin over first
-            if (lastAdmin && choice !== 'assign') {
+            if (lastAdmin && choice === 'close') {
 
                 this.closeSession(user);
 
@@ -1275,6 +1382,17 @@ export class ModelRoom extends Room {
                 this.fixLocks();
 
                 console.log(`[${this.roomId}] ${user.name} handed admin to "${next.name}"`);
+
+            } else if (lastAdmin) {
+
+                // Leaving without choosing: oldest editor,
+                // or the end of the session
+                if (!this.handOverAdmin(user)) {
+
+                    this.closeSession(user);
+
+                    return;
+                }
             }
 
 
@@ -1344,32 +1462,65 @@ export class ModelRoom extends Room {
         }
 
 
-        const byAge = (a, b) => a.joinedAt - b.joinedAt;
+        // No session without an admin: the oldest editor
+        // takes over, and with no editor it ends
+        this.noAdminSince = null;
 
-        const next =
-            online.filter((u) => u.role === 'editor').sort(byAge)[0] ||
-            online.filter((u) => u.role === 'viewer').sort(byAge)[0];
+        if (this.handOverAdmin(null)) {
 
-        if (!next) {
+            this.sendState();
+
             return;
         }
 
+        console.log(`[${this.roomId}] no admin and no editor online - closing`);
 
-        next.role = 'admin';
-
-        this.noAdminSince = null;
-
-        this.fixLocks();
+        this.closeSession({ name: 'the server (no admin left)' });
+    }
 
 
-        console.log(`[${this.roomId}] no admin online - promoted "${next.name}"`);
+    /*
+     * Take out people who did nothing for IDLE_MINUTES
+     * (they are warned IDLE_WARNING_MINUTES before). They
+     * keep their role and can come back with the link.
+     */
+    idleWatchdog() {
 
+        const now = Date.now();
 
-        this.sendApproved('session:notice', {
-            text: `${next.name} is now admin (no admin was online)`
-        });
+        for (const user of [...this.users.values()]) {
 
-        this.sendState();
+            if (!user.online) {
+                continue;
+            }
+
+            const idle = now - user.lastActive;
+
+            if (idle >= IDLE_MINUTES * 60000) {
+
+                console.log(`[${this.roomId}] "${user.name}" inactive for ${IDLE_MINUTES} min - taken out`);
+
+                this.disconnectUser(
+                    user,
+                    LEAVE_CODES.INACTIVE,
+                    `You were inactive for ${IDLE_MINUTES} minutes`
+                );
+
+                this.afterUserGone(user);
+
+                if (this.closed) {
+                    return;
+                }
+
+            } else if (!user.idleWarned && idle >= (IDLE_MINUTES - IDLE_WARNING_MINUTES) * 60000) {
+
+                user.idleWarned = true;
+
+                this.sendToUser(user, 'session:idle-warning', {
+                    secondsLeft: Math.round((IDLE_MINUTES * 60000 - idle) / 1000)
+                });
+            }
+        }
     }
 
 
@@ -1791,6 +1942,10 @@ export class ModelRoom extends Room {
             return null;
         }
 
+        if (object.overrideBy) {
+            return `${this.nameOf(object.overrideBy)} (admin) is moving this object`;
+        }
+
         if (object.heldBy && object.heldBy !== user.userId) {
             return `${this.nameOf(object.heldBy)} is editing this object`;
         }
@@ -1808,6 +1963,10 @@ export class ModelRoom extends Room {
     fixLocks() {
 
         for (const object of this.objects.values()) {
+
+            if (object.overrideBy && this.users.get(object.overrideBy)?.role !== 'admin') {
+                object.overrideBy = null;
+            }
 
             if (!object.heldBy) {
                 continue;
@@ -1837,6 +1996,10 @@ export class ModelRoom extends Room {
 
             if (object.heldBy === userId) {
                 object.heldBy = null;
+            }
+
+            if (object.overrideBy === userId) {
+                object.overrideBy = null;
             }
         }
     }
@@ -1899,7 +2062,9 @@ export class ModelRoom extends Room {
                 name: o.name,
                 addedBy: o.addedBy,
                 assignedTo: o.assignedTo,
-                heldBy: o.heldBy
+                heldBy: o.heldBy,
+                // An admin moving it while heldBy keeps the lock
+                overrideBy: o.overrideBy || null
             });
         }
 
@@ -2076,6 +2241,13 @@ export class ModelRoom extends Room {
     }
 
 
+    noteActivity(user) {
+
+        user.lastActive = Date.now();
+        user.idleWarned = false;
+    }
+
+
     // Message handler for approved users only
     onApproved(type, handler) {
 
@@ -2086,6 +2258,8 @@ export class ModelRoom extends Room {
             if (!user || user.status !== 'approved' || !user.clients.has(client)) {
                 return;
             }
+
+            this.noteActivity(user);
 
             Promise.resolve(handler(client, user, data)).catch((error) => {
                 console.error(`[${this.roomId}] ${type} failed:`, error);
