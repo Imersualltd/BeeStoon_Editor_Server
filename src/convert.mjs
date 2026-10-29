@@ -144,7 +144,7 @@ async function handleConvert(req, res) {
     busy = true;
 
     // The user's file name is never used on disk
-    const workDir = path.join(tmpdir(), `be-water-convert-${randomUUID()}`);
+    const workDir = path.join(tmpdir(), `beestoon-editor-convert-${randomUUID()}`);
     const inputPath = path.join(workDir, 'input.fbx');
 
     // Must end in lower-case ".glb" for binary output

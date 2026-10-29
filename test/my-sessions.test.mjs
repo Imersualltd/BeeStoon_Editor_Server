@@ -203,7 +203,7 @@ const mine = (name) => api('GET', name.toLowerCase(), name, '/sessions/mine');
 // SERVER
 // ==================================================
 
-const storageDir = await mkdtemp(path.join(tmpdir(), 'be-water-mine-test-'));
+const storageDir = await mkdtemp(path.join(tmpdir(), 'beestoon-editor-mine-test-'));
 
 const server = spawn(process.execPath, ['src/index.mjs'], {
     env: {

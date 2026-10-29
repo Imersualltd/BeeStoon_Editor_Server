@@ -156,7 +156,7 @@ async function approve(admin, user, role) {
 // SERVER
 // ==================================================
 
-const storageDir = await mkdtemp(path.join(tmpdir(), 'be-water-admin-test-'));
+const storageDir = await mkdtemp(path.join(tmpdir(), 'beestoon-editor-admin-test-'));
 
 const server = spawn(process.execPath, ['src/index.mjs'], {
     env: {

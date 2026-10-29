@@ -9,7 +9,7 @@
  * same as AR_STORAGE, so one setting covers both):
  *
  *   local (default)  a folder on this machine
- *                    (SCENE_LOCAL_DIR, default <tmp>/be-water-scenes).
+ *                    (SCENE_LOCAL_DIR, default <tmp>/beestoon-editor-scenes).
  *                    Fine for development, but on Render the
  *                    folder is wiped on every redeploy, so
  *                    saved scenes are lost too.
@@ -82,7 +82,7 @@ function checkKey(key) {
 
 function createLocalStorage() {
 
-    const root = process.env.SCENE_LOCAL_DIR || path.join(tmpdir(), 'be-water-scenes');
+    const root = process.env.SCENE_LOCAL_DIR || path.join(tmpdir(), 'beestoon-editor-scenes');
 
     const fileOf = (key) => path.join(root, ...checkKey(key).split('/'));
 

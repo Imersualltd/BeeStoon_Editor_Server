@@ -149,7 +149,7 @@ const server = spawn(process.execPath, ['src/index.mjs'], {
         MAIL_PROVIDER: 'log',
         // Saved sessions of this run only
         SCENE_STORAGE: 'local',
-        SCENE_LOCAL_DIR: mkdtempSync(path.join(tmpdir(), 'be-water-roles-test-'))
+        SCENE_LOCAL_DIR: mkdtempSync(path.join(tmpdir(), 'beestoon-editor-roles-test-'))
     },
     stdio: ['ignore', 'pipe', 'pipe']
 });
