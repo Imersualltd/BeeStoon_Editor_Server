@@ -139,13 +139,18 @@ import { ASSET_ID_PATTERN, blobKey, SCENE_ID_PATTERN } from './assets.mjs';
 import { SESSION_TYPES, sessionTypeOf } from './session-types.mjs';
 import { getSceneStorage } from './scene-storage.mjs';
 import {
+    balanceOf, charge, creditsEnabled, ENTRY_COST, MAX_POOL,
+    poolFromOptions, SESSION_COSTS
+} from './credits.mjs';
+import {
     cleanText,
     latestVersion,
     loadVersion,
     MAX_VERSION_DESCRIPTION,
     MAX_VERSION_NAME,
     saveVersion,
-    sceneOfKey
+    sceneOfKey,
+    updateScene
 } from './scene-versions.mjs';
 import {
     issueTicket,
@@ -261,6 +266,18 @@ export class ModelRoom extends Room {
         this.owner = saved ? saved.owner : null;
 
         this.limits = SESSION_TYPES[this.sessionType];
+
+        // Credit pool (credits.mjs). A new session's pool
+        // is paid by its creator on joining (onAuth).
+        this.credits = saved
+            ? { total: 0, left: 0, forEntry: false, forModels: false, ...saved.credits }
+            : poolFromOptions(options);
+
+        this.creatorCharged = !!saved;
+
+        // People who paid their entry (or the pool did).
+        // Earlier attendees of a saved session already did.
+        this.entryPaid = new Set(Object.keys(saved?.attendees || {}));
 
         // Several browsers per person
         this.maxClients = Math.min(200, this.limits.people * 4);
@@ -402,13 +419,160 @@ export class ModelRoom extends Room {
             );
         }
 
+        await this.chargeOnJoin(identity);
+
         return identity;
+    }
+
+
+    /*
+     * Credits on joining (see credits.mjs). Throws 402
+     * when someone cannot pay.
+     */
+    async chargeOnJoin(identity) {
+
+        if (!creditsEnabled()) {
+            return;
+        }
+
+        const { userId, name, email } = identity;
+
+        // The creator of a new session pays its type
+        // and the pool
+        if (!this.hasCreator && !this.creatorCharged) {
+
+            const cost = SESSION_COSTS[this.sessionType] + this.credits.total;
+
+            this.creatorCharged = true;
+
+            try {
+                identity.balance = await charge(
+                    userId,
+                    cost,
+                    `Started ${this.sessionType} session "${this.sessionName}"` +
+                    (this.credits.total ? ` with a pool of ${this.credits.total}` : '')
+                );
+            } catch (error) {
+                this.creatorCharged = false;
+                throw new ServerError(402, error.userMessage || 'Could not take the credits');
+            }
+
+            this.credits.left = this.credits.total;
+            this.entryPaid.add(userId);
+
+            return;
+        }
+
+        identity.balance = await balanceOf(userId);
+
+        // Here before, a second browser, or the owner
+        if (this.entryPaid.has(userId) || this.users.has(userId) || userId === this.owner?.userId) {
+            return;
+        }
+
+        // Invited by email: in straight away, so pay now
+        const cleanedEmail = cleanEmail(email);
+
+        if (cleanedEmail && this.invites.has(cleanedEmail)) {
+
+            try {
+                await this.payEntry(identity);
+            } catch (error) {
+                throw new ServerError(402, error.userMessage || 'Could not take the credits');
+            }
+
+            return;
+        }
+
+        // Waits for an admin: pays when let in, but say
+        // now if that cannot work
+        if (!this.poolPaysEntry() && identity.balance < ENTRY_COST) {
+            throw new ServerError(
+                402,
+                `You need ${ENTRY_COST} credit to join this session (you have ${identity.balance}).`
+            );
+        }
+    }
+
+
+    poolPaysEntry() {
+
+        return this.credits.forEntry && this.credits.left >= ENTRY_COST;
+    }
+
+
+    // One entry, from the pool or the person
+    async payEntry(person) {
+
+        if (this.entryPaid.has(person.userId)) {
+            return;
+        }
+
+        if (this.poolPaysEntry()) {
+
+            this.credits.left -= ENTRY_COST;
+
+            this.poolChanged();
+
+        } else {
+
+            const balance = await charge(person.userId, ENTRY_COST, `Joined "${this.sessionName}"`);
+
+            person.balance = balance;
+        }
+
+        this.entryPaid.add(person.userId);
+    }
+
+
+    /*
+     * Model generation (BeeStoon): the pool pays when the
+     * admin allowed it and has enough, else the person.
+     * Returns 'pool' or 'self'; throws (userMessage) when
+     * neither can pay.
+     */
+    async spendForModel(userId, amount, reason = 'Model generation') {
+
+        if (!creditsEnabled()) {
+            return 'free';
+        }
+
+        if (this.credits.forModels && this.credits.left >= amount) {
+
+            this.credits.left -= amount;
+
+            this.poolChanged();
+
+            return 'pool';
+        }
+
+        const balance = await charge(userId, amount, `${reason} in "${this.sessionName}"`);
+
+        const user = this.users.get(userId);
+
+        if (user) {
+            user.balance = balance;
+            this.sendState();
+        }
+
+        return 'self';
+    }
+
+
+    // Keep a saved session's pool up to date
+    poolChanged() {
+
+        if (this.scene) {
+            updateScene(this.sceneId, { credits: { ...this.credits } }).catch((error) => {
+                console.error(`[${this.roomId}] Could not save the credit pool: ${error.message}`);
+            });
+        }
     }
 
 
     onJoin(client) {
 
-        const { userId, name, email = null } = client.auth;
+        const { userId, name, email = null, balance = null } = client.auth;
 
         client.userData = { userId };
 
@@ -473,6 +637,10 @@ export class ModelRoom extends Room {
 
 
         user.clients.add(client);
+
+        if (balance !== null && balance !== undefined) {
+            user.balance = balance;
+        }
 
         user.lastActive = Date.now();
         user.idleWarned = false;
@@ -978,7 +1146,7 @@ export class ModelRoom extends Room {
 
     registerAdminMessages() {
 
-        this.onAdmin('join:approve', (client, admin, data) => {
+        this.onAdmin('join:approve', async (client, admin, data) => {
 
             const user = this.users.get(data?.userId);
 
@@ -988,6 +1156,25 @@ export class ModelRoom extends Room {
 
             if (!ROLES.includes(data.role)) {
                 return this.actionDenied(client, 'join:approve', 'Unknown role');
+            }
+
+
+            if (creditsEnabled() && !this.entryPaid.has(user.userId)) {
+
+                try {
+                    await this.payEntry(user);
+                } catch (error) {
+                    return this.actionDenied(
+                        client,
+                        'join:approve',
+                        `${user.name} has no credits left to enter, and the credit pool does not cover entries`
+                    );
+                }
+
+                // Left or was let in meanwhile
+                if (user.status !== 'pending' || !this.users.has(user.userId)) {
+                    return;
+                }
             }
 
 
@@ -1001,6 +1188,50 @@ export class ModelRoom extends Room {
 
             // The client asks for the models (sync-request)
             // when it sees its status change to approved.
+            this.sendState();
+        });
+
+
+        // Put more of the admin's credits into the pool
+        this.onAdmin('credits:add', async (client, admin, data) => {
+
+            const amount = Math.floor(Number(data?.amount));
+
+            if (!creditsEnabled() || !Number.isFinite(amount) || amount < 1 ||
+                this.credits.total + amount > MAX_POOL) {
+                return this.actionDenied(client, 'credits:add', 'Not a valid amount');
+            }
+
+            try {
+                admin.balance = await charge(admin.userId, amount, `Added to the pool of "${this.sessionName}"`);
+            } catch (error) {
+                return this.actionDenied(client, 'credits:add', error.userMessage || 'Could not take the credits');
+            }
+
+            this.credits.total += amount;
+            this.credits.left += amount;
+
+            this.poolChanged();
+
+            console.log(`[${this.roomId}] ${admin.name} added ${amount} credits to the pool`);
+
+            this.sendState();
+        });
+
+
+        // What the pool pays for
+        this.onAdmin('credits:pool', (client, admin, data) => {
+
+            if (typeof data?.forEntry === 'boolean') {
+                this.credits.forEntry = data.forEntry;
+            }
+
+            if (typeof data?.forModels === 'boolean') {
+                this.credits.forModels = data.forModels;
+            }
+
+            this.poolChanged();
+
             this.sendState();
         });
 
@@ -1740,6 +1971,7 @@ export class ModelRoom extends Room {
                     name: this.sessionName,
                     sessionType: this.sessionType,
                     owner: this.owner,
+                    credits: { ...this.credits },
                     attendees,
                     removed: [...this.banned],
                     baseUrl: this.baseUrl
@@ -2103,12 +2335,28 @@ export class ModelRoom extends Room {
                 fileBytes: this.limits.fileBytes
             },
             usedBytes: this.usedBytes(),
+            credits: creditsEnabled()
+                ? {
+                    pool: {
+                        total: this.credits.total,
+                        left: this.credits.left,
+                        forEntry: this.credits.forEntry,
+                        forModels: this.credits.forModels
+                    },
+                    // This person's own credits
+                    balance: user.balance ?? null,
+                    entryCost: ENTRY_COST,
+                    sessionCost: SESSION_COSTS[this.sessionType]
+                }
+                : null,
             features: {
                 emailInvites: isAdmin && mailerReady(),
                 // POST /assets + object:add { assetId }
                 assetUploads: true,
                 // scene:save / scene:versions / scene:restore
-                versions: true
+                versions: true,
+                // credits:add / credits:pool (admins)
+                credits: creditsEnabled()
             }
         };
     }
@@ -2289,7 +2537,7 @@ export class ModelRoom extends Room {
                 return this.actionDenied(client, type, 'Only admins can do this');
             }
 
-            handler(client, user, data);
+            return handler(client, user, data);
         });
     }
 }
