@@ -62,6 +62,19 @@ export function registerSession(sessionKey, room, { reopen = false } = {}) {
 }
 
 
+// Live rooms (for My sessions)
+export function liveRooms() {
+
+    return [...rooms.values()];
+}
+
+
+export function liveRoomOf(sessionKey) {
+
+    return rooms.get(sessionKey) || null;
+}
+
+
 export function unregisterSession(sessionKey, room) {
 
     if (rooms.get(sessionKey) === room) {

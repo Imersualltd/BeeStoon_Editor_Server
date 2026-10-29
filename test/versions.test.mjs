@@ -201,6 +201,22 @@ server.stdout.on('data', (d) => (serverLog += d));
 server.stderr.on('data', (d) => (serverLog += d));
 
 
+// Let the server finish its last saves before the
+// temp folder is removed
+function stopServer() {
+
+    if (server.exitCode !== null) {
+        return Promise.resolve();
+    }
+
+    const exited = new Promise((resolve) => server.once('exit', resolve));
+
+    server.kill();
+
+    return Promise.race([exited, sleep(5000)]);
+}
+
+
 async function main() {
 
     await waitFor(() => serverLog.includes('listening'), 'server start', 15000);
@@ -423,7 +439,7 @@ async function main() {
 
 main()
     .then(async () => {
-        server.kill();
+        await stopServer();
         await rm(storageDir, { recursive: true, force: true });
         process.exit(0);
     })
@@ -431,7 +447,7 @@ main()
         console.error(`\nFAILED: ${error.message}`);
         console.error(error.stack);
         console.error('\n--- server log ---\n' + serverLog);
-        server.kill();
+        await stopServer();
         await rm(storageDir, { recursive: true, force: true });
         process.exit(1);
     });
