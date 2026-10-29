@@ -70,7 +70,9 @@
  *
  *   client -> server (admins only)
  *     'scene:restore'     { versionId }  (unsaved changes are
- *                         saved first as "Before restore")
+ *                         saved first as "Before restore"; the
+ *                         result is saved as 'Restored "<name>"',
+ *                         so it is what the session opens with)
  *     'invite:email'      { emails: [..], role, link }
  *                         (standard text + "Join session" button)
  *                         (only when features.emailInvites; the
@@ -1896,9 +1898,19 @@ export class ModelRoom extends Room {
         }
 
 
-        this.dirty = false;
-
         console.log(`[${this.roomId}] ${admin.name} restored "${manifest.name}"`);
+
+
+        // The restored scene is now the latest version, so
+        // re-opening the session later starts from it (not
+        // from the version saved before the restore)
+        this.dirty = true;
+
+        await this.save({
+            auto: true,
+            name: `Restored "${manifest.name}"`.slice(0, 80),
+            description: `${admin.name} restored the version "${manifest.name}"`
+        }, admin);
 
         this.sendApproved('scene:restored', {
             version: this.scene.versions.find((v) => v.id === versionId),

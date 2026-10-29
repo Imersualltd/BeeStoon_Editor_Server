@@ -6,7 +6,7 @@
  * through the PORT environment variable.
  */
 
-import { defineServer, defineRoom } from 'colyseus';
+import { defineServer, defineRoom, matchMaker } from 'colyseus';
 import { WebSocketTransport } from '@colyseus/ws-transport';
 import { ModelRoom } from './ModelRoom.mjs';
 import { getAuthAdapter } from './auth/index.mjs';
@@ -27,6 +27,15 @@ const HOST = process.env.HOST || '0.0.0.0';
 // Check the identity settings now, so a wrong
 // AUTH_PROVIDER stops the server at start-up.
 getAuthAdapter();
+
+
+// Colyseus answers every CORS preflight (OPTIONS) for
+// the whole server, also for our own HTTP routes. Let
+// browsers send the headers those routes use: the test
+// account (X-Identity, My sessions with AUTH_PROVIDER=
+// dev) and the ngrok free-plan header.
+matchMaker.controller.DEFAULT_CORS_HEADERS['Access-Control-Allow-Headers'] +=
+    ', X-Identity, ngrok-skip-browser-warning';
 
 
 const server = defineServer({

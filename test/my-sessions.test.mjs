@@ -251,6 +251,18 @@ async function main() {
 
     console.log('\nAsking who you are');
 
+    const preflight = await fetch(`${URL}/sessions/mine`, {
+        method: 'OPTIONS',
+        headers: {
+            Origin: 'https://launch.playcanvas.com',
+            'Access-Control-Request-Method': 'GET',
+            'Access-Control-Request-Headers': 'x-identity'
+        }
+    });
+    check('browsers may send the X-Identity header (CORS)', () => {
+        assert.match(preflight.headers.get('access-control-allow-headers') || '', /X-Identity/i);
+    });
+
     const noOne = await fetch(`${URL}/sessions/mine`);
     check('without an identity the list is refused (401)', () => assert.equal(noOne.status, 401));
 
