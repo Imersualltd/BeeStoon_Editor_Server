@@ -6,7 +6,7 @@
   "main": "src/index.mjs",
   "scripts": {
     "start": "node src/index.mjs",
-    "test": "node test/roles.test.mjs && node test/ar-share.test.mjs && node test/assets.test.mjs && node test/versions.test.mjs && node test/admin-rules.test.mjs && node test/my-sessions.test.mjs"
+    "test": "node test/roles.test.mjs && node test/ar-share.test.mjs && node test/assets.test.mjs && node test/versions.test.mjs && node test/admin-rules.test.mjs && node test/my-sessions.test.mjs && node test/credits.test.mjs"
   },
   "engines": {
     "node": ">=22"

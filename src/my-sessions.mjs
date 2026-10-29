@@ -56,7 +56,7 @@ export function registerMySessionsRoutes(app) {
 }
 
 
-async function identify(req, res) {
+export async function identify(req, res) {
 
     const header = String(req.headers.authorization || '');
 

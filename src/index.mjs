@@ -15,6 +15,7 @@ import { registerExportFbxRoute } from './export-fbx.mjs';
 import { registerArShareRoutes } from './ar-share.mjs';
 import { registerAssetRoutes } from './assets.mjs';
 import { registerMySessionsRoutes } from './my-sessions.mjs';
+import { registerCreditRoutes } from './credits.mjs';
 
 
 const PORT = Number(process.env.PORT) || 2567;
@@ -90,6 +91,7 @@ const server = defineServer({
 
         // GET /sessions/mine, DELETE /sessions/<key> : My sessions (see my-sessions.mjs)
         registerMySessionsRoutes(app);
+        registerCreditRoutes(app);
     }
 });
 

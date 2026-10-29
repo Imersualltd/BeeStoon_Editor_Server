@@ -62,7 +62,7 @@ export const MAX_VERSION_DESCRIPTION = 500;
 // person index), so two saves never overwrite each other
 const queues = new Map();
 
-function queued(key, task) {
+export function queued(key, task) {
 
     const previous = queues.get(key) || Promise.resolve();
 
@@ -84,7 +84,7 @@ function queued(key, task) {
 // READING
 // ==================================================
 
-async function readJson(key) {
+export async function readJson(key) {
 
     const body = await getSceneStorage().get(key);
 
@@ -92,7 +92,7 @@ async function readJson(key) {
 }
 
 
-async function writeJson(key, value) {
+export async function writeJson(key, value) {
 
     await getSceneStorage().put(key, Buffer.from(JSON.stringify(value)));
 }
@@ -322,6 +322,11 @@ export function saveVersion(info, objects, version) {
         scene.name = info.name || scene.name;
         scene.lastActivity = now;
 
+        // Credit pool (credits.mjs) goes with the session
+        if (info.credits) {
+            scene.credits = info.credits;
+        }
+
         for (const [userId, attendee] of Object.entries(info.attendees || {})) {
             scene.attendees[userId] = { ...scene.attendees[userId], ...attendee };
         }
@@ -370,6 +375,10 @@ export function updateScene(sceneId, changes) {
 
         if (changes.name) {
             scene.name = changes.name;
+        }
+
+        if (changes.credits) {
+            scene.credits = changes.credits;
         }
 
         for (const [userId, attendee] of Object.entries(changes.attendees || {})) {
