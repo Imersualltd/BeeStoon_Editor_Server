@@ -354,8 +354,10 @@ async function main() {
         assert.equal(lamp.size, 64);
     });
 
-    const lampFile = await fetch(last(bob, 'object:add', (p) => p.id === 'lamp').url);
-    check('and its link works', () => assert.equal(lampFile.status, 200));
+    const lampFile = await fetch(last(bob, 'object:add', (p) => p.id === 'lamp').url, {
+        headers: { Authorization: `Bearer ${bob.state.you.ticket}` }
+    });
+    check('and its link works for a member', () => assert.equal(lampFile.status, 200));
 
 
     console.log('\nAutosave');

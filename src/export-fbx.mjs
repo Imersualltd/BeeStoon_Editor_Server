@@ -32,6 +32,7 @@
  */
 
 import express from 'express';
+import { setCorsOrigin } from './cors.mjs';
 import { zipSync } from 'fflate';
 
 import { spawn } from 'node:child_process';
@@ -69,7 +70,7 @@ export function registerExportFbxRoute(app) {
     // The editor runs on another origin: CORS + preflight
     app.use('/export/fbx', (req, res, next) => {
 
-        res.setHeader('Access-Control-Allow-Origin', '*');
+        setCorsOrigin(req, res);
         res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
         res.setHeader(
             'Access-Control-Allow-Headers',

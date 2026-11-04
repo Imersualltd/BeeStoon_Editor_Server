@@ -362,7 +362,7 @@ export function saveVersion(info, objects, version) {
 }
 
 
-// Name, attendees, last activity - without a new version
+// Name, attendees, invites, last activity - without a new version
 export function updateScene(sceneId, changes) {
 
     return queued(sceneId, async () => {
@@ -383,6 +383,11 @@ export function updateScene(sceneId, changes) {
 
         if (changes.sessionType) {
             scene.sessionType = changes.sessionType;
+        }
+
+        // Open email invites { email: { role, expiresAt, invitedBy } }
+        if (changes.invites) {
+            scene.invites = changes.invites;
         }
 
         for (const [userId, attendee] of Object.entries(changes.attendees || {})) {

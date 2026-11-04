@@ -77,7 +77,14 @@
  *                         (standard text + "Join session" button)
  *                         (only when features.emailInvites; the
  *                         invited email signs in -> approved with
- *                         that role, no waiting)
+ *                         that role, no waiting. Only a VERIFIED
+ *                         email from the login counts; the link
+ *                         alone only asks to join. Invites expire
+ *                         after INVITE_TTL_HOURS (default 72), are
+ *                         kept with a saved session, and a kicked
+ *                         person stays out. With INVITE_BASE_URL
+ *                         set, the email always links there.)
+ *     'invite:revoke'     { email }
  *     'join:approve'      { userId, role }
  *     'join:deny'         { userId }
  *     'role:set'          { userId, role }
@@ -153,8 +160,8 @@ import { ASSET_ID_PATTERN, blobKey, SCENE_ID_PATTERN } from './assets.mjs';
 import { SESSION_TYPES, sessionTypeOf, upgradeCost } from './session-types.mjs';
 import { getSceneStorage } from './scene-storage.mjs';
 import {
-    balanceOf, charge, creditsEnabled, ENTRY_COST, MAX_POOL,
-    poolFromOptions, SESSION_COSTS
+    balanceOf, charge, creditsEnabled, ENTRY_COST, generationChargeEnabled,
+    generationCost, MAX_POOL, poolFromOptions, SESSION_COSTS
 } from './credits.mjs';
 import {
     cleanText,
@@ -220,6 +227,14 @@ const ROLES = ['admin', 'editor', 'viewer'];
 // session per hour (spam brake)
 const MAX_INVITES_PER_MESSAGE = 20;
 const MAX_INVITES_PER_HOUR = 50;
+
+// How long an email invite is valid
+function inviteTtlMs() {
+
+    const hours = Number(process.env.INVITE_TTL_HOURS);
+
+    return (Number.isFinite(hours) && hours > 0 ? hours : 72) * 60 * 60 * 1000;
+}
 
 export const LEAVE_CODES = {
     KICKED: 4101,
@@ -325,8 +340,9 @@ export class ModelRoom extends Room {
         // online = at least one open connection
         this.users = new Map();
 
-        // Invited email -> role (used up on first join)
-        this.invites = new Map();
+        // Invited email -> { role, expiresAt, invitedBy }
+        // (used up on first join; kept with a saved session)
+        this.invites = new Map(Object.entries(saved?.invites || {}));
 
         // Times (ms) invites were sent, for the limit
         this.inviteTimes = [];
@@ -464,7 +480,8 @@ export class ModelRoom extends Room {
                     userId,
                     cost,
                     `Started ${this.sessionType} session "${this.sessionName}"` +
-                    (this.credits.total ? ` with a pool of ${this.credits.total}` : '')
+                    (this.credits.total ? ` with a pool of ${this.credits.total}` : ''),
+                    this.chargeKey('create')
                 );
             } catch (error) {
                 this.creatorCharged = false;
@@ -487,7 +504,7 @@ export class ModelRoom extends Room {
         // Invited by email: in straight away, so pay now
         const cleanedEmail = cleanEmail(email);
 
-        if (cleanedEmail && this.invites.has(cleanedEmail)) {
+        if (cleanedEmail && this.inviteRole(cleanedEmail)) {
 
             try {
                 await this.payEntry(identity);
@@ -530,7 +547,8 @@ export class ModelRoom extends Room {
 
         } else {
 
-            const balance = await charge(person.userId, ENTRY_COST, `Joined "${this.sessionName}"`);
+            const balance = await charge(person.userId, ENTRY_COST, `Joined "${this.sessionName}"`,
+                this.chargeKey(`entry:${person.userId}`));
 
             person.balance = balance;
         }
@@ -545,7 +563,7 @@ export class ModelRoom extends Room {
      * Returns 'pool' or 'self'; throws (userMessage) when
      * neither can pay.
      */
-    async spendForModel(userId, amount, reason = 'Model generation') {
+    async spendForModel(userId, amount, reason = 'Model generation', requestId = randomUUID()) {
 
         if (!creditsEnabled()) {
             return 'free';
@@ -560,7 +578,8 @@ export class ModelRoom extends Room {
             return 'pool';
         }
 
-        const balance = await charge(userId, amount, `${reason} in "${this.sessionName}"`);
+        const balance = await charge(userId, amount, `${reason} in "${this.sessionName}"`,
+            this.chargeKey(`generation:${userId}:${requestId}`));
 
         const user = this.users.get(userId);
 
@@ -570,6 +589,15 @@ export class ModelRoom extends Room {
         }
 
         return 'self';
+    }
+
+
+    // Idempotency key of one charge in this session. The
+    // sceneId is random per session (and kept across a
+    // server restart), so keys never repeat across sessions.
+    chargeKey(what) {
+
+        return `editor:${this.sceneId}:${what}`;
     }
 
 
@@ -629,13 +657,15 @@ export class ModelRoom extends Room {
                 user.status = 'approved';
                 user.role = this.scene.attendees[userId].role;
 
-            } else if (email && this.invites.has(email)) {
+            } else if (email && this.inviteRole(email)) {
 
-                // Invited by email: in straight away
+                // Invited by email (verified address): in straight away
                 user.status = 'approved';
-                user.role = this.invites.get(email);
+                user.role = this.inviteRole(email);
 
                 this.invites.delete(email);
+
+                this.invitesChanged();
 
                 console.log(`[${this.roomId}] "${name}" joins by email invite as ${user.role}`);
             }
@@ -1217,7 +1247,8 @@ export class ModelRoom extends Room {
             }
 
             try {
-                admin.balance = await charge(admin.userId, amount, `Added to the pool of "${this.sessionName}"`);
+                admin.balance = await charge(admin.userId, amount, `Added to the pool of "${this.sessionName}"`,
+                    this.chargeKey(`pool:${randomUUID()}`));
             } catch (error) {
                 return this.actionDenied(client, 'credits:add', error.userMessage || 'Could not take the credits');
             }
@@ -1262,7 +1293,8 @@ export class ModelRoom extends Room {
                         admin.userId,
                         cost + pool,
                         `Upgraded "${this.sessionName}" to ${SESSION_TYPES[to].label}` +
-                        (pool ? ` with ${pool} more in the pool` : '')
+                        (pool ? ` with ${pool} more in the pool` : ''),
+                        this.chargeKey(`upgrade:${from}-${to}:${randomUUID()}`)
                     );
                 } catch (error) {
                     return this.actionDenied(client, 'session:upgrade', error.userMessage || 'Could not take the credits');
@@ -1315,14 +1347,30 @@ export class ModelRoom extends Room {
         this.onApproved('generation:charge', async (client, user, data) => {
 
             const requestId = cleanText(data?.requestId, 80);
-            const cost = Math.floor(Number(data?.cost ?? 1));
 
-            if (!requestId || !Number.isFinite(cost) || cost < 0 || cost > 1000) {
+            // The price is the server's (GENERATION_COST), never
+            // the client's: data.cost is ignored. With BeeStoon
+            // credits the model is priced by BeeStoon instead.
+            const cost = generationCost();
+
+            if (!requestId || !ID_PATTERN.test(requestId)) {
                 return client.send('generation:denied', { requestId, reason: 'Not a valid generation request' });
             }
 
+            if (!generationChargeEnabled()) {
+                return client.send('generation:charged', { requestId, cost: 0, paidBy: 'free' });
+            }
+
+            user.generationCharges = user.generationCharges || new Set();
+
+            if (user.generationCharges.has(requestId)) {
+                return client.send('generation:denied', { requestId, reason: 'This generation was already paid' });
+            }
+
+            user.generationCharges.add(requestId);
+
             try {
-                const paidBy = cost === 0 ? 'free' : await this.spendForModel(user.userId, cost, 'BeeStoon AI generation');
+                const paidBy = cost === 0 ? 'free' : await this.spendForModel(user.userId, cost, 'BeeStoon AI generation', requestId);
 
                 client.send('generation:charged', { requestId, cost, paidBy });
 
@@ -1330,6 +1378,7 @@ export class ModelRoom extends Room {
 
                 this.sendState();
             } catch (error) {
+                user.generationCharges.delete(requestId);
                 client.send('generation:denied', { requestId, reason: error.userMessage || 'Not enough credits' });
             }
         });
@@ -1539,6 +1588,21 @@ export class ModelRoom extends Room {
                 this.actionDenied(client, 'invite:email', 'The invite could not be sent');
             });
         });
+
+
+        // Take back an invite nobody used yet
+        this.onAdmin('invite:revoke', (client, admin, data) => {
+
+            const email = cleanEmail(data?.email);
+
+            if (!email || !this.invites.delete(email)) {
+                return this.actionDenied(client, 'invite:revoke', 'No open invite for that address');
+            }
+
+            console.log(`[${this.roomId}] ${admin.name} revoked an invite`);
+
+            this.invitesChanged();
+        });
     }
 
 
@@ -1603,7 +1667,12 @@ export class ModelRoom extends Room {
 
                 await sendInvite({ to: email, from: admin.name, role, link });
 
-                this.invites.set(email, role);
+                // Again for the same address: the newest role and expiry
+                this.invites.set(email, {
+                    role,
+                    expiresAt: new Date(Date.now() + inviteTtlMs()).toISOString(),
+                    invitedBy: admin.userId
+                });
 
                 sent.push(email);
 
@@ -1613,6 +1682,10 @@ export class ModelRoom extends Room {
             }
         }
 
+
+        if (sent.length) {
+            this.invitesChanged();
+        }
 
         console.log(
             `[${this.roomId}] ${admin.name} invited ${sent.length} by email as ${role}` +
@@ -1629,9 +1702,67 @@ export class ModelRoom extends Room {
     }
 
 
-    // The client's share link if it opens this session,
-    // else INVITE_BASE_URL?session=<key>, else null
+    // Role of a still valid invite for this (verified) email
+    inviteRole(email) {
+
+        const invite = this.invites.get(email);
+
+        if (!invite) {
+            return null;
+        }
+
+        // Invites saved before expiry existed: role only
+        const { role, expiresAt } = typeof invite === 'string' ? { role: invite, expiresAt: null } : invite;
+
+        if (expiresAt && Date.parse(expiresAt) < Date.now()) {
+            this.invites.delete(email);
+            this.saveInvites();
+            return null;
+        }
+
+        return ROLES.includes(role) ? role : null;
+    }
+
+
+    // Admins see the change; a saved session keeps it
+    invitesChanged() {
+
+        this.sendState();
+
+        this.saveInvites();
+    }
+
+
+    saveInvites() {
+
+        if (this.scene) {
+            updateScene(this.sceneId, { invites: Object.fromEntries(this.invites) }).catch((error) => {
+                console.error(`[${this.roomId}] Could not save the invites: ${error.message}`);
+            });
+        }
+    }
+
+
+    // INVITE_BASE_URL?session=<key> when set (the BeeStoon
+    // site's editor page; the client's own address is not
+    // used then), else the client's share link if it opens
+    // this session, else null
     inviteLink(value) {
+
+        if (process.env.INVITE_BASE_URL) {
+
+            try {
+
+                const url = new URL(process.env.INVITE_BASE_URL);
+
+                url.searchParams.set('session', this.sessionKey);
+
+                return url.toString();
+
+            } catch {
+                return null;   // bad setting
+            }
+        }
 
         try {
 
@@ -1650,21 +1781,6 @@ export class ModelRoom extends Room {
             // not a URL
         }
 
-
-        if (process.env.INVITE_BASE_URL) {
-
-            try {
-
-                const url = new URL(process.env.INVITE_BASE_URL);
-
-                url.searchParams.set('session', this.sessionKey);
-
-                return url.toString();
-
-            } catch {
-                // bad setting
-            }
-        }
 
         return null;
     }
@@ -2111,7 +2227,14 @@ export class ModelRoom extends Room {
                 }
             );
 
+            const firstSave = !this.scene;
+
             this.scene = scene;
+
+            // Invites sent before the first save are kept too
+            if (firstSave && this.invites.size) {
+                this.saveInvites();
+            }
 
             this.saveError = null;
 
@@ -2475,6 +2598,12 @@ export class ModelRoom extends Room {
                     sessionCost: SESSION_COSTS[this.sessionType]
                 }
                 : null,
+            // Open email invites (admins only)
+            invites: isAdmin
+                ? [...this.invites.keys()]
+                    .filter((email) => this.inviteRole(email))
+                    .map((email) => ({ email, role: this.inviteRole(email), expiresAt: this.invites.get(email).expiresAt || null }))
+                : undefined,
             features: {
                 emailInvites: isAdmin && mailerReady(),
                 // POST /assets + object:add { assetId }
@@ -2485,8 +2614,9 @@ export class ModelRoom extends Room {
                 credits: creditsEnabled(),
                 // session:upgrade (admins)
                 sessionUpgrade: true,
-                // generation:charge (BeeStoon AI)
-                generationCharge: true
+                // generation:charge (BeeStoon AI); off when
+                // BeeStoon prices the model itself
+                generationCharge: generationChargeEnabled()
             }
         };
     }

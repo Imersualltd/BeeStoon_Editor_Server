@@ -8,7 +8,7 @@
  */
 
 import { spawn } from 'node:child_process';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
@@ -398,8 +398,16 @@ async function main() {
         assert.equal(gone[1].json.saved.length, 0);
     });
 
+    // The link alone no longer opens a model (members only, with
+    // a ticket), so look in the storage folder itself
+    const sceneFolder = path.join(storageDir, 'scenes', new globalThis.URL(chair.json.url).pathname.split('/')[2]);
+    const leftovers = await readdir(sceneFolder, { recursive: true, withFileTypes: true })
+        .then((entries) => entries.filter((e) => e.isFile()).map((e) => e.name), () => []);
     const model = await fetch(chair.json.url);
-    check('its model files are deleted too', () => assert.equal(model.status, 404));
+    check('its model files are deleted too', () => {
+        assert.deepEqual(leftovers, []);
+        assert.notEqual(model.status, 200);
+    });
 
     const reopen = await connect('Ada', KEY, 'create').then(() => null, (e) => e);
     check('a deleted session\'s link stays closed', () => {

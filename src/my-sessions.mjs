@@ -20,6 +20,7 @@
  */
 
 import { getAuthAdapter } from './auth/index.mjs';
+import { setCorsOrigin } from './cors.mjs';
 import { deleteScene, sceneOfKey, scenesOfUser } from './scene-versions.mjs';
 import { liveRoomOf, liveRooms, SESSION_KEY_PATTERN } from './sessions.mjs';
 
@@ -28,7 +29,7 @@ export function registerMySessionsRoutes(app) {
 
     app.use('/sessions', (req, res, next) => {
 
-        res.setHeader('Access-Control-Allow-Origin', '*');
+        setCorsOrigin(req, res);
         res.setHeader('Access-Control-Allow-Methods', 'GET, DELETE, OPTIONS');
         res.setHeader(
             'Access-Control-Allow-Headers',

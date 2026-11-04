@@ -35,6 +35,7 @@
  */
 
 import express from 'express';
+import { setCorsOrigin } from './cors.mjs';
 
 import { randomBytes } from 'node:crypto';
 import { pipeline } from 'node:stream/promises';
@@ -70,7 +71,7 @@ export function registerArShareRoutes(app) {
     // the model from the viewer page: CORS + preflight
     app.use('/ar', (req, res, next) => {
 
-        res.setHeader('Access-Control-Allow-Origin', '*');
+        setCorsOrigin(req, res);
         res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
         res.setHeader(
             'Access-Control-Allow-Headers',

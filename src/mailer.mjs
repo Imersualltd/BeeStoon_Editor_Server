@@ -12,6 +12,9 @@
  *                             in Resend)
  *   MAIL_PROVIDER=log     prints the email to the server
  *                         log instead (development, tests)
+ *   MAIL_PROVIDER=capture writes each email as a JSON file
+ *                         to MAIL_CAPTURE_DIR and sends
+ *                         nothing (local end-to-end tests)
  *   (not set)             no email invites: the client
  *                         opens the admin's own email app
  *
@@ -37,6 +40,10 @@ export function mailerReady() {
 
     if (name === 'log') {
         return true;
+    }
+
+    if (name === 'capture') {
+        return !!process.env.MAIL_CAPTURE_DIR;
     }
 
     if (name === 'resend') {
@@ -85,6 +92,21 @@ export async function sendInvite({ to, from, role, link }) {
     if (name === 'log') {
 
         console.log(`[mail] invite to ${to} (${role}): ${link}`);
+
+        return;
+    }
+
+    if (name === 'capture' && mailerReady()) {
+
+        const { mkdir, writeFile } = await import('node:fs/promises');
+        const { randomUUID } = await import('node:crypto');
+        const path = await import('node:path');
+
+        await mkdir(process.env.MAIL_CAPTURE_DIR, { recursive: true });
+        await writeFile(
+            path.join(process.env.MAIL_CAPTURE_DIR, `${Date.now()}-${randomUUID()}.json`),
+            JSON.stringify({ to, from, role, link, subject, text, html, at: new Date().toISOString() }, null, 2)
+        );
 
         return;
     }

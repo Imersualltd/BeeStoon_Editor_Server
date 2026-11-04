@@ -17,6 +17,7 @@
  */
 
 import express from 'express';
+import { setCorsOrigin } from './cors.mjs';
 
 import { randomUUID } from 'node:crypto';
 import { chmod, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
@@ -51,7 +52,7 @@ export function registerConvertRoute(app) {
      */
     app.use('/convert', (req, res, next) => {
 
-        res.setHeader('Access-Control-Allow-Origin', '*');
+        setCorsOrigin(req, res);
         res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
         res.setHeader(
             'Access-Control-Allow-Headers',

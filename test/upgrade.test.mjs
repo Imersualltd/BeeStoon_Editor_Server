@@ -326,9 +326,22 @@ async function main() {
         assert.ok(bob.got('generation:charged', (p) => p.requestId === 'r2' && p.paidBy === 'pool'));
     });
 
-    bob.send('generation:charge', { requestId: 'r3', cost: 500 });
-    await waitFor(() => bob.got('generation:denied', (p) => p.requestId === 'r3'), 'r3');
-    check('too expensive -> generation:denied', () => assert.ok(true));
+    // The price is the server's: a client cost of 0 (or 500) changes nothing
+    bob.send('generation:charge', { requestId: 'r3', cost: 0 });
+    await waitFor(() => bob.got('generation:charged', (p) => p.requestId === 'r3'), 'r3');
+    check('a client cost of 0 is not free', () => {
+        assert.ok(bob.got('generation:charged', (p) => p.requestId === 'r3' && p.cost === 1 && p.paidBy !== 'free'));
+    });
+
+    bob.send('generation:charge', { requestId: 'r4', cost: 500 });
+    await waitFor(() => bob.got('generation:charged', (p) => p.requestId === 'r4'), 'r4');
+    check('a client cost of 500 is charged the server price', () => {
+        assert.ok(bob.got('generation:charged', (p) => p.requestId === 'r4' && p.cost === 1));
+    });
+
+    bob.send('generation:charge', { requestId: 'r4', cost: 1 });
+    await waitFor(() => bob.got('generation:denied', (p) => p.requestId === 'r4'), 'r4 again');
+    check('the same generation is never paid twice', () => assert.ok(true));
 
     ada.room.leave();
     bob.room.leave();

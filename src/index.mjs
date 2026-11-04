@@ -9,13 +9,15 @@
 import { defineServer, defineRoom, matchMaker } from 'colyseus';
 import { WebSocketTransport } from '@colyseus/ws-transport';
 import { ModelRoom } from './ModelRoom.mjs';
-import { getAuthAdapter } from './auth/index.mjs';
+import { getAuthAdapter, productionProblems } from './auth/index.mjs';
 import { registerConvertRoute } from './convert.mjs';
 import { registerExportFbxRoute } from './export-fbx.mjs';
 import { registerArShareRoutes } from './ar-share.mjs';
 import { registerAssetRoutes } from './assets.mjs';
 import { registerMySessionsRoutes } from './my-sessions.mjs';
 import { registerCreditRoutes } from './credits.mjs';
+import { allowedOrigins, originFor } from './cors.mjs';
+import { registerInternalRoutes } from './internal.mjs';
 
 
 const PORT = Number(process.env.PORT) || 2567;
@@ -23,6 +25,15 @@ const PORT = Number(process.env.PORT) || 2567;
 // 0.0.0.0 = accept connections from outside the
 // container, not only from the same machine.
 const HOST = process.env.HOST || '0.0.0.0';
+
+
+// Unsafe production settings stop the server at start-up
+const problems = productionProblems();
+
+if (problems.length) {
+    console.error(`Refusing to start in production:\n  - ${problems.join('\n  - ')}`);
+    process.exit(1);
+}
 
 
 // Check the identity settings now, so a wrong
@@ -37,6 +48,18 @@ getAuthAdapter();
 // dev) and the ngrok free-plan header.
 matchMaker.controller.DEFAULT_CORS_HEADERS['Access-Control-Allow-Headers'] +=
     ', X-Identity, ngrok-skip-browser-warning';
+
+// Joining a room: only the allowed site origins
+// (CORS_ORIGINS, see cors.mjs)
+if (allowedOrigins().length) {
+
+    delete matchMaker.controller.DEFAULT_CORS_HEADERS['Access-Control-Allow-Origin'];
+
+    matchMaker.controller.getCorsHeaders = (headers) => {
+        const origin = originFor(headers.get('origin'));
+        return origin ? { 'Access-Control-Allow-Origin': origin, Vary: 'Origin' } : { Vary: 'Origin' };
+    };
+}
 
 
 const server = defineServer({
@@ -92,6 +115,9 @@ const server = defineServer({
         // GET /sessions/mine, DELETE /sessions/<key> : My sessions (see my-sessions.mjs)
         registerMySessionsRoutes(app);
         registerCreditRoutes(app);
+
+        // GET /internal/sessions/<key>/members/<userId> : for the BeeStoon backend (see internal.mjs)
+        registerInternalRoutes(app);
     }
 });
 

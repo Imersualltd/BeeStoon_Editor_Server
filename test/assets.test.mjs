@@ -242,15 +242,24 @@ async function main() {
         assert.match(up.json.url, new RegExp(`/assets/[A-Za-z0-9_-]{20,64}/${up.json.assetId}\\.glb$`));
     });
 
-    const download = await fetch(up.json.url);
+    const member = { headers: { Authorization: `Bearer ${vic.state.you.ticket}` } };
+
+    const download = await fetch(up.json.url, member);
     const bytes = Buffer.from(await download.arrayBuffer());
-    check('the link gives back the same file', () => {
+    check('a member (even a viewer) gets back the same file', () => {
         assert.equal(download.status, 200);
         assert.equal(download.headers.get('content-type'), 'model/gltf-binary');
         assert.ok(bytes.equals(glb));
     });
 
-    const missing = await fetch(up.json.url.replace(/[0-9a-f]{64}/, 'f'.repeat(64)));
+    const linkOnly = await fetch(up.json.url);
+    const forged = await fetch(up.json.url, { headers: { Authorization: 'Bearer not-a-ticket' } });
+    check('the link alone, or a made-up ticket, gets nothing', () => {
+        assert.equal(linkOnly.status, 401);
+        assert.equal(forged.status, 401);
+    });
+
+    const missing = await fetch(up.json.url.replace(/[0-9a-f]{64}/, 'f'.repeat(64)), member);
     check('an unknown model link is 404', () => assert.equal(missing.status, 404));
 
     const again = await upload(ada.state.you.ticket, glb, 'chair copy.glb');

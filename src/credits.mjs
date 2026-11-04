@@ -21,13 +21,28 @@
  * Re-opening a saved session costs nothing; its pool
  * is saved with it (scene.credits).
  *
- * Until the BeeStoon accounts exist, wallets live in
- * the scene storage (wallets/<user>.json) and a new
- * person starts with CREDITS_START credits (default
- * 20). CREDITS_ENABLED=false turns all of this off.
+ * Where the credits live (CREDITS_PROVIDER):
+ *
+ *   beestoon  the BeeStoon account balance is the only
+ *             ledger. charge / refund / balanceOf call
+ *             BeeStoon's internal editor credit API
+ *             (BEESTOON_API_URL, EDITOR_SERVICE_KEY). Every
+ *             charge has an idempotency key, so a retry
+ *             never charges twice. Nobody gets free
+ *             starting credits. Model generation is priced
+ *             by BeeStoon itself (on import), so the
+ *             generation:charge message is switched off.
+ *
+ *   local     (default, development) wallets live in the
+ *             scene storage (wallets/<user>.json) and a new
+ *             person starts with CREDITS_START credits
+ *             (default 20).
+ *
+ * CREDITS_ENABLED=false turns all of this off.
  */
 
 import { queued, readJson, writeJson } from './scene-versions.mjs';
+import { setCorsOrigin } from './cors.mjs';
 import { identify } from './my-sessions.mjs';
 
 
@@ -45,6 +60,80 @@ export const MAX_POOL = 10000;
 export function creditsEnabled() {
 
     return process.env.CREDITS_ENABLED !== 'false';
+}
+
+
+export function creditsProvider() {
+
+    return (process.env.CREDITS_PROVIDER || 'local').toLowerCase() === 'beestoon' ? 'beestoon' : 'local';
+}
+
+
+// generation:charge (the editor's own model price) only
+// without BeeStoon: there BeeStoon prices the model
+export function generationChargeEnabled() {
+
+    return creditsEnabled() && creditsProvider() !== 'beestoon';
+}
+
+
+// Server-side price of one generation (local wallets);
+// the client's own number is never used
+export function generationCost() {
+
+    const value = Number(process.env.GENERATION_COST);
+
+    return Number.isInteger(value) && value >= 0 && value <= 1000 ? value : 1;
+}
+
+
+// ==================================================
+// BEESTOON LEDGER
+// ==================================================
+
+async function beestoon(method, path, body) {
+
+    const base = String(process.env.BEESTOON_API_URL || '').replace(/\/+$/, '');
+    const key = process.env.EDITOR_SERVICE_KEY || '';
+
+    const unavailable = () => {
+        const error = new Error('BeeStoon credits unavailable');
+        error.userMessage = 'BeeStoon credits are not available right now. Please try again in a moment.';
+        return error;
+    };
+
+    if (!base || key.length < 32) {
+        throw unavailable();
+    }
+
+    let response;
+
+    try {
+        response = await fetch(`${base}${path}`, {
+            method,
+            headers: { 'Content-Type': 'application/json', 'X-Editor-Service-Key': key },
+            body: body ? JSON.stringify(body) : undefined,
+            signal: AbortSignal.timeout(10000)
+        });
+    } catch {
+        throw unavailable();
+    }
+
+    const data = await response.json().catch(() => ({}));
+
+    if (response.status === 402) {
+        const error = new Error('not enough credits');
+        error.userMessage = data?.detail?.error || 'Not enough BeeStoon credits.';
+        error.balance = data?.detail?.balance;
+        throw error;
+    }
+
+    if (!response.ok) {
+        console.error(`BeeStoon credits ${method} ${path} answered ${response.status}`);
+        throw unavailable();
+    }
+
+    return data;
 }
 
 
@@ -78,6 +167,14 @@ export async function balanceOf(userId) {
         return null;
     }
 
+    if (creditsProvider() === 'beestoon') {
+        try {
+            return (await beestoon('GET', `/internal/editor/credits/${encodeURIComponent(userId)}`)).balance;
+        } catch {
+            return null;   // unknown: the next charge decides
+        }
+    }
+
     return (await readWallet(userId)).balance;
 }
 
@@ -85,9 +182,22 @@ export async function balanceOf(userId) {
 /*
  * Take `amount` credits from a person. Throws an error
  * with userMessage when the balance is too low.
- * Returns the new balance.
+ * Returns the new balance. `key` names this one charge
+ * ("editor:<sessionKey>:<what>"): the same key never
+ * charges twice (BeeStoon ledger).
  */
-export function charge(userId, amount, reason) {
+export function charge(userId, amount, reason, key) {
+
+    if (creditsProvider() === 'beestoon') {
+
+        if (!key) {
+            throw new Error('A BeeStoon charge needs an idempotency key');
+        }
+
+        return beestoon('POST', '/internal/editor/credits/charge', {
+            userId, amount, reason: String(reason || '').slice(0, 200), key
+        }).then((answer) => answer.balance);
+    }
 
     return queued(walletKey(userId), async () => {
 
@@ -117,8 +227,15 @@ export function charge(userId, amount, reason) {
 }
 
 
-// Give credits back (e.g. a refund)
-export function refund(userId, amount, reason) {
+// Give credits back (e.g. a refund): once per charge
+export function refund(userId, amount, reason, chargeKey) {
+
+    if (creditsProvider() === 'beestoon') {
+
+        return beestoon('POST', '/internal/editor/credits/refund', {
+            userId, amount, reason: String(reason || '').slice(0, 200), chargeKey, key: `${chargeKey}:refund`
+        }).then((answer) => answer.balance);
+    }
 
     return queued(walletKey(userId), async () => {
 
@@ -172,7 +289,7 @@ export function registerCreditRoutes(app) {
 
     app.use('/credits', (req, res, next) => {
 
-        res.setHeader('Access-Control-Allow-Origin', '*');
+        setCorsOrigin(req, res);
         res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
         res.setHeader(
             'Access-Control-Allow-Headers',

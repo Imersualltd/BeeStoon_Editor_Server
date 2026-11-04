@@ -189,3 +189,20 @@ export function requireMember(req, res, next) {
 
     next();
 }
+
+
+/*
+ * Is the request's ticket (Authorization: Bearer) one of
+ * an approved member of the live session that owns this
+ * sceneId? Used for model downloads.
+ */
+export function memberOfScene(req, sceneId) {
+
+    const header = String(req.headers.authorization || '');
+
+    const ticket = header.startsWith('Bearer ') ? header.slice(7).trim() : '';
+
+    const entry = ticket ? tickets.get(ticket) : null;
+
+    return !!entry && entry.room.sceneId === sceneId && !!entry.room.roleOf(entry.userId);
+}

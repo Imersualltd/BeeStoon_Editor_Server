@@ -17,9 +17,16 @@
  *      Everyone receives { ..., assetId, size, url }.
  *
  *   3. GET /assets/<sceneId>/<assetId>.glb
+ *        Auth:  Authorization: Bearer <session ticket>
+ *               of an approved member (any role) of the
+ *               live session that owns <sceneId>
  *      The model. With S3/Spaces storage this redirects
  *      to a short-lived signed link, so the download
- *      comes from the bucket and not through this server.
+ *      comes from the bucket and not through this server
+ *      (browsers drop the Authorization header on that
+ *      cross-origin redirect). Kicked people lose their
+ *      ticket at once. ASSET_DOWNLOAD_AUTH=open restores
+ *      the old link-only access (development only).
  *
  * Files are stored once per scene by content (sha256),
  * so the same model imported twice, or kept in many
@@ -28,17 +35,18 @@
  * <sceneId>/blobs/<assetId>.glb.
  *
  * The sceneId is a long random id, made when the
- * session starts. A model link works for anyone who has
- * it, like the AR links; only session members get them.
+ * session starts. Public sharing is a separate step:
+ * an AR link (ar-share.mjs).
  */
 
 import express from 'express';
+import { setCorsOrigin } from './cors.mjs';
 
 import { createHash } from 'node:crypto';
 
 import { baseUrl } from './ar-share.mjs';
 import { getSceneStorage } from './scene-storage.mjs';
-import { requireEditor } from './sessions.mjs';
+import { memberOfScene, requireEditor } from './sessions.mjs';
 import { SESSION_TYPES } from './session-types.mjs';
 
 
@@ -70,7 +78,7 @@ export function registerAssetRoutes(app) {
 
     app.use('/assets', (req, res, next) => {
 
-        res.setHeader('Access-Control-Allow-Origin', '*');
+        setCorsOrigin(req, res);
         res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
         res.setHeader(
             'Access-Control-Allow-Headers',
@@ -95,6 +103,12 @@ export function registerAssetRoutes(app) {
 
     app.get(
         '/assets/:sceneId/:file',
+        (req, res, next) => {
+            if (process.env.ASSET_DOWNLOAD_AUTH === 'open' || memberOfScene(req, req.params.sceneId)) {
+                return next();
+            }
+            res.status(401).send('Join the session to load its models');
+        },
         (req, res) => handleDownload(req, res, storage).catch((error) => fail(res, error))
     );
 

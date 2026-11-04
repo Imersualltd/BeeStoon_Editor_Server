@@ -9,13 +9,23 @@
  * Env variables:
  *   JWT_SECRET      shared secret  (HS256)  or
  *   JWT_PUBLIC_KEY  PEM public key (RS256)
- *   JWT_ISSUER      expected "iss" (optional)
+ *   JWT_ISSUER      expected "iss" (required in production)
+ *   JWT_AUDIENCE    expected "aud" (required in production;
+ *                   BeeStoon: "beestoon-editor")
+ *   JWT_MAX_AGE_SECONDS  longest accepted token lifetime
+ *                   (exp - iat), default 3600. Long-lived
+ *                   site logins are refused.
+ *
+ * With BeeStoon, JWT_SECRET is EDITOR_JWT_SECRET (the
+ * editor's own secret), never the site's signing key.
  *
  * Token claims used:
- *   sub   -> userId (required)
+ *   sub   -> userId "jwt:<sub>" (required). BeeStoon puts
+ *            the account id (UUID) here, never the email.
  *   name  -> display name (or preferred_username)
- *   email -> matched against email invites (ignored
- *            when email_verified is false)
+ *   email -> matched against email invites, ONLY when
+ *            email_verified is exactly true
+ *   exp   -> required
  *
  * The same "sub" in several browsers is one person
  * (ModelRoom keeps all their connections).
@@ -65,8 +75,20 @@ export const jwtAdapter = {
 
         const payload = jwt.verify(raw, key, {
             algorithms,
-            issuer: process.env.JWT_ISSUER || undefined
+            issuer: process.env.JWT_ISSUER || undefined,
+            audience: process.env.JWT_AUDIENCE || undefined
         });
+
+        if (typeof payload.exp !== 'number') {
+            throw new Error('Token has no expiry');
+        }
+
+        const maxAge = Number(process.env.JWT_MAX_AGE_SECONDS) || 3600;
+        const issuedAt = typeof payload.iat === 'number' ? payload.iat : Math.floor(Date.now() / 1000);
+
+        if (payload.exp - issuedAt > maxAge) {
+            throw new Error('Token lives too long for the editor');
+        }
 
         const userId = String(payload.sub ?? '');
 
@@ -77,7 +99,8 @@ export const jwtAdapter = {
         return {
             userId: `jwt:${userId}`,
             name: cleanName(payload.name || payload.preferred_username) || 'User',
-            email: payload.email_verified === false ? null : cleanEmail(payload.email)
+            // A missing claim is NOT verified
+            email: payload.email_verified === true ? cleanEmail(payload.email) : null
         };
     }
 };
