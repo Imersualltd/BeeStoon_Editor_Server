@@ -104,6 +104,7 @@
  *     'object:denied'     { id, reason, transform? }  (no permission;
  *                         transform = the pose to snap back to)
  *     'action:denied'     { type, reason }   (admin action refused)
+ *     'session:upgraded'  { from, to, by, cost, pool }
  *     'scene:saved'       { version }   (version summary)
  *     'scene:restored'    { version, by }
  *                         (then object:remove / add / transform)
@@ -118,6 +119,19 @@
  * version - full id list, then 'object:add' for every
  * object the client does not have yet, then poses.
  * serverId changes on every server start.
+ *
+ * Upgrading (admins): 'session:upgrade' { to, creditPool?,
+ * poolForEntry?, poolForModels? } moves single -> basic ->
+ * workshop (never down). The admin pays UPGRADE_COST_PER_STEP
+ * per step plus creditPool (added to the pool). Limits grow
+ * at once; everyone gets 'session:upgraded' and a new
+ * session:state.
+ *
+ * Model generation (BeeStoon AI): 'generation:charge'
+ * { requestId, cost } -> 'generation:charged' { requestId,
+ * paidBy: pool|self|free } or 'generation:denied'
+ * { requestId, reason }. The editor calls it before it opens
+ * the BeeStoon generation page.
  *
  * Session type (create option sessionType: single,
  * basic, workshop; see session-types.mjs) limits the
@@ -136,7 +150,7 @@ import { getAuthAdapter } from './auth/index.mjs';
 import { cleanEmail } from './auth/util.mjs';
 import { mailerReady, sendInvite } from './mailer.mjs';
 import { ASSET_ID_PATTERN, blobKey, SCENE_ID_PATTERN } from './assets.mjs';
-import { SESSION_TYPES, sessionTypeOf } from './session-types.mjs';
+import { SESSION_TYPES, sessionTypeOf, upgradeCost } from './session-types.mjs';
 import { getSceneStorage } from './scene-storage.mjs';
 import {
     balanceOf, charge, creditsEnabled, ENTRY_COST, MAX_POOL,
@@ -1216,6 +1230,108 @@ export class ModelRoom extends Room {
             console.log(`[${this.roomId}] ${admin.name} added ${amount} credits to the pool`);
 
             this.sendState();
+        });
+
+
+        // Upgrade the session type (single -> basic -> workshop)
+        this.onAdmin('session:upgrade', async (client, admin, data) => {
+
+            const to = data?.to;
+            const from = this.sessionType;
+
+            if (!Object.hasOwn(SESSION_TYPES, to)) {
+                return this.actionDenied(client, 'session:upgrade', 'Unknown session type');
+            }
+
+            const cost = upgradeCost(from, to);
+
+            if (cost === null) {
+                return this.actionDenied(client, 'session:upgrade', 'A session can only be upgraded, not downgraded');
+            }
+
+            const pool = data?.creditPool === undefined ? 0 : Math.floor(Number(data.creditPool));
+
+            if (!Number.isFinite(pool) || pool < 0 || this.credits.total + pool > MAX_POOL) {
+                return this.actionDenied(client, 'session:upgrade', 'Not a valid credit pool amount');
+            }
+
+            if (creditsEnabled()) {
+
+                try {
+                    admin.balance = await charge(
+                        admin.userId,
+                        cost + pool,
+                        `Upgraded "${this.sessionName}" to ${SESSION_TYPES[to].label}` +
+                        (pool ? ` with ${pool} more in the pool` : '')
+                    );
+                } catch (error) {
+                    return this.actionDenied(client, 'session:upgrade', error.userMessage || 'Could not take the credits');
+                }
+
+                if (pool) {
+                    this.credits.total += pool;
+                    this.credits.left += pool;
+                }
+            }
+
+            if (typeof data?.poolForEntry === 'boolean') {
+                this.credits.forEntry = data.poolForEntry;
+            }
+
+            if (typeof data?.poolForModels === 'boolean') {
+                this.credits.forModels = data.poolForModels;
+            }
+
+            // Someone else may have upgraded while we waited
+            // for the wallet: never go down
+            if ((upgradeCost(this.sessionType, to) ?? 0) > 0) {
+                this.sessionType = to;
+                this.limits = SESSION_TYPES[to];
+                this.maxClients = Math.min(200, this.limits.people * 4);
+            }
+
+            if (this.scene) {
+                updateScene(this.sceneId, { sessionType: this.sessionType, credits: { ...this.credits } }).catch((error) => {
+                    console.error(`[${this.roomId}] Could not save the upgrade: ${error.message}`);
+                });
+            }
+
+            console.log(`[${this.roomId}] ${admin.name} upgraded ${from} -> ${this.sessionType} (cost ${cost}, pool +${pool})`);
+
+            this.sendApproved('session:upgraded', {
+                from,
+                to: this.sessionType,
+                by: { userId: admin.userId, name: admin.name },
+                cost: creditsEnabled() ? cost : 0,
+                pool: creditsEnabled() ? pool : 0
+            });
+
+            this.sendState();
+        });
+
+
+        // BeeStoon AI generation: the pool pays when allowed,
+        // else the person (spendForModel)
+        this.onApproved('generation:charge', async (client, user, data) => {
+
+            const requestId = cleanText(data?.requestId, 80);
+            const cost = Math.floor(Number(data?.cost ?? 1));
+
+            if (!requestId || !Number.isFinite(cost) || cost < 0 || cost > 1000) {
+                return client.send('generation:denied', { requestId, reason: 'Not a valid generation request' });
+            }
+
+            try {
+                const paidBy = cost === 0 ? 'free' : await this.spendForModel(user.userId, cost, 'BeeStoon AI generation');
+
+                client.send('generation:charged', { requestId, cost, paidBy });
+
+                console.log(`[${this.roomId}] ${user.name} generation ${requestId} (${cost}, ${paidBy})`);
+
+                this.sendState();
+            } catch (error) {
+                client.send('generation:denied', { requestId, reason: error.userMessage || 'Not enough credits' });
+            }
         });
 
 
@@ -2366,7 +2482,11 @@ export class ModelRoom extends Room {
                 // scene:save / scene:versions / scene:restore
                 versions: true,
                 // credits:add / credits:pool (admins)
-                credits: creditsEnabled()
+                credits: creditsEnabled(),
+                // session:upgrade (admins)
+                sessionUpgrade: true,
+                // generation:charge (BeeStoon AI)
+                generationCharge: true
             }
         };
     }

@@ -381,6 +381,10 @@ export function updateScene(sceneId, changes) {
             scene.credits = changes.credits;
         }
 
+        if (changes.sessionType) {
+            scene.sessionType = changes.sessionType;
+        }
+
         for (const [userId, attendee] of Object.entries(changes.attendees || {})) {
             scene.attendees[userId] = { ...scene.attendees[userId], ...attendee };
         }
