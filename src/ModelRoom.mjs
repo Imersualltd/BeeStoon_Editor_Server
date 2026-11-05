@@ -163,15 +163,18 @@
  * last person leaves; model files are in storage.
  */
 
-import { randomBytes, randomUUID } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { Room, ServerError } from 'colyseus';
 
 import { getAuthAdapter } from './auth/index.mjs';
 import { ACCESS_REMOVED_CODE, AccessError, requireAccess } from './editor-access.mjs';
 import { arSharingEnabled } from './ar-share.mjs';
+import { downloadModel, INSERTION_ID, InsertionError, insertionApi } from './insertions.mjs';
 import { cleanEmail } from './auth/util.mjs';
 import { mailerReady, sendInvite } from './mailer.mjs';
 import { ASSET_ID_PATTERN, blobKey, SCENE_ID_PATTERN, textureKey } from './assets.mjs';
+
+const GLB_MAGIC = 0x46546C67;   // "glTF" (assets.mjs)
 import { SESSION_TYPES, sessionTypeOf, upgradeCost } from './session-types.mjs';
 import { getSceneStorage } from './scene-storage.mjs';
 import {
@@ -348,6 +351,11 @@ export class ModelRoom extends Room {
             : SCENE_ID_PATTERN.test(String(options?.sceneId ?? ''))
                 ? options.sceneId
                 : randomBytes(22).toString('base64url');
+
+        // BeeStoon insertions: in progress here, and added
+        // but not yet confirmed to the API (after a save)
+        this.inserting = new Set();
+        this.unconfirmed = new Map();   // insertionId -> objectId
 
         // Public address of this server, for model links
         this.baseUrl = process.env.PUBLIC_BASE_URL
@@ -1141,6 +1149,10 @@ export class ModelRoom extends Room {
 
             this.sendState();
         });
+
+
+        // A BeeStoon model its owner asked to add (insertions.mjs)
+        this.onApproved('beestoon:insert', (client, user, data) => this.insertBeeStoonModel(client, user, data));
 
 
         // Material / texture edit of one material of a model
@@ -2440,6 +2452,9 @@ export class ModelRoom extends Room {
 
         const changesAtStart = this.changeCount;
 
+        // Insertions whose object is in this save: confirmed after it
+        const toConfirm = [...this.unconfirmed].filter(([, objectId]) => this.objects.has(objectId));
+
         this.saving = true;
         this.sendState();
 
@@ -2499,6 +2514,8 @@ export class ModelRoom extends Room {
                 this.sendApproved('scene:saved', { version: summary });
             }
 
+            await this.confirmInsertions(toConfirm);
+
             return summary;
 
         } catch (error) {
@@ -2554,7 +2571,10 @@ export class ModelRoom extends Room {
                 // Kept: people come back with the same id
                 // (an admin can unassign)
                 assignedTo: o.assignedTo ?? null,
-                heldBy: null
+                heldBy: null,
+                ...(INSERTION_ID.test(String(o.insertionId || ''))
+                    ? { insertionId: o.insertionId, source: cleanSource(o.source) }
+                    : {})
             });
         }
 
@@ -2971,6 +2991,153 @@ export class ModelRoom extends Room {
 
 
     /*
+     * Adds a BeeStoon model its owner asked for: reserved
+     * on the API (this session only, the owner only), the
+     * file copied into this session's storage, the object
+     * added for everyone, the scene saved, then confirmed.
+     * Never twice: an object of the same insertion here
+     * answers "already added".
+     */
+    async insertBeeStoonModel(client, user, data) {
+
+        const insertionId = String(data?.insertionId || '');
+
+        const fail = (message, code = null) =>
+            client.send('beestoon:insert-failed', { insertionId, message, code });
+
+        if (!INSERTION_ID.test(insertionId)) {
+            return fail('Invalid request');
+        }
+
+        if (user.role !== 'admin' && user.role !== 'editor') {
+            return fail('Viewers cannot add models', 'role');
+        }
+
+        const existing = [...this.objects.values()].find((o) => o.insertionId === insertionId);
+
+        if (existing) {
+            client.send('beestoon:inserted', { insertionId, objectId: existing.id, name: existing.name, already: true });
+            if (this.unconfirmed.has(insertionId)) {
+                await this.confirmInsertions([[insertionId, existing.id]]);
+            }
+            return;
+        }
+
+        if (this.inserting.has(insertionId)) {
+            return fail('This model is being added already', 'busy');
+        }
+
+        this.inserting.add(insertionId);
+
+        try {
+
+            const reserved = await insertionApi.reserve(insertionId, this.sessionKey, user.userId);
+
+            const body = await downloadModel(reserved.fileUrl, this.limits.fileBytes);
+
+            if (body.length < 20 || body.readUInt32LE(0) !== GLB_MAGIC || body.readUInt32LE(4) !== 2) {
+                throw new InsertionError('The model file is not a GLB', 'not_glb');
+            }
+
+            const assetId = createHash('sha256').update(body).digest('hex');
+
+            const reason = this.uploadDenial(assetId, body.length);
+
+            if (reason) {
+                throw new InsertionError(reason, 'too_big');
+            }
+
+            const storage = getSceneStorage();
+            const key = blobKey(this.sceneId, assetId);
+
+            if (!(await storage.exists(key))) {
+                await storage.put(key, body);
+            }
+
+            const url = this.assetUrl(assetId);
+
+            this.uploads.set(assetId, { size: body.length, url });
+
+            // A room switch or a removal while downloading: never here
+            if (this.closed || [...this.objects.values()].some((o) => o.insertionId === insertionId)) {
+                throw new InsertionError('This model was not added here', 'changed');
+            }
+
+            const object = {
+                id: `bs_${insertionId.slice(0, 8)}_${randomBytes(4).toString('hex')}`,
+                name: String(reserved.name || 'BeeStoon model').slice(0, 120),
+                assetId,
+                size: body.length,
+                url,
+                // No transform: the file's own (canonical) scale
+                transform: null,
+                materials: {},
+                addedBy: user.userId,
+                assignedTo: null,
+                heldBy: null,
+                overrideBy: null,
+                insertionId,
+                source: cleanSource({ kind: 'beestoon', modelId: reserved.modelId, variant: reserved.variant })
+            };
+
+            this.objects.set(object.id, object);
+            this.unconfirmed.set(insertionId, object.id);
+            this.markDirty();
+
+            console.log(`[${this.roomId}] BeeStoon model "${object.name}" added by ${user.name} (insertion ${insertionId.slice(0, 8)})`);
+
+            // Everyone, the person who asked too
+            this.sendApproved('object:add', object);
+            this.sendState();
+
+            await this.saveAfterInsert(object.name);
+
+            client.send('beestoon:inserted', {
+                insertionId,
+                objectId: object.id,
+                name: object.name,
+                confirmed: !this.unconfirmed.has(insertionId)
+            });
+
+        } catch (error) {
+
+            fail(error instanceof InsertionError ? error.message : 'The model could not be added. Try again.',
+                error.code || null);
+
+        } finally {
+            this.inserting.delete(insertionId);
+        }
+    }
+
+
+    // Save now (after a save already running), so the insertion is confirmed
+    async saveAfterInsert(name) {
+
+        for (let i = 0; this.saving && i < 100; i++) {
+            await new Promise((resolve) => setTimeout(resolve, 100));
+        }
+
+        await this.save({ auto: true, name: `Added ${name}`.slice(0, 60) }, null);
+    }
+
+
+    async confirmInsertions(entries) {
+
+        for (const [insertionId, objectId] of entries) {
+            try {
+                await insertionApi.confirm(insertionId, this.sessionKey, objectId);
+                this.unconfirmed.delete(insertionId);
+            } catch (error) {
+                if (error.code === 'already_added' || error.code === 'wrong_session' || error.code === 'not_found') {
+                    this.unconfirmed.delete(insertionId);
+                }
+                console.warn(`[${this.roomId}] could not confirm insertion ${insertionId.slice(0, 8)}: ${error.message}`);
+            }
+        }
+    }
+
+
+    /*
      * Editor access was removed from this person's account
      * (editor-access.mjs): every browser leaves and every
      * download ticket stops working. The role stays with
@@ -3111,6 +3278,20 @@ export class ModelRoom extends Room {
 // ==================================================
 // VALIDATION
 // ==================================================
+
+function cleanSource(source) {
+
+    if (!source || source.kind !== 'beestoon') {
+        return null;
+    }
+
+    return {
+        kind: 'beestoon',
+        modelId: INSERTION_ID.test(String(source.modelId || '')) ? source.modelId : null,
+        variant: ['finalized', 'original'].includes(source.variant) ? source.variant : null
+    };
+}
+
 
 function isValidId(value) {
 

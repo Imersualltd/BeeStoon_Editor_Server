@@ -281,7 +281,10 @@ export function saveVersion(info, objects, version) {
                 // Material edits (materials.mjs); the GLB is unchanged
                 materials: object.materials || {},
                 addedBy: object.addedBy,
-                assignedTo: object.assignedTo
+                assignedTo: object.assignedTo,
+                // A BeeStoon model added through an insertion (insertions.mjs):
+                // kept so a retry after reopening never adds it twice
+                ...(object.insertionId ? { insertionId: object.insertionId, source: object.source || null } : {})
             });
         }
 
