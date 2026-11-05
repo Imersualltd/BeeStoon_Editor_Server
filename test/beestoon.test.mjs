@@ -181,7 +181,7 @@ async function main() {
     check('development settings are refused in production', () => {
         const problems = productionProblems({ NODE_ENV: 'production', AUTH_PROVIDER: 'dev', ALLOW_DEV_AUTH: 'true',
             CORS_ORIGINS: '*', INVITE_BASE_URL: 'https://beestoon.example/editor' });
-        for (const text of ['AUTH_PROVIDER', 'ALLOW_DEV_AUTH', 'JWT_AUDIENCE', 'CORS_ORIGINS', 'placeholder', 'credits']) {
+        for (const text of ['AUTH_PROVIDER', 'ALLOW_DEV_AUTH', 'JWT_AUDIENCE', 'CORS_ORIGINS', 'placeholder', 'credits', 'EDITOR_ACCESS']) {
             assert.ok(problems.some((p) => p.includes(text)), text);
         }
     });
@@ -195,7 +195,7 @@ async function main() {
         assert.deepEqual(productionProblems({ NODE_ENV: 'production', AUTH_PROVIDER: 'jwt', JWT_SECRET: SECRET,
             JWT_ISSUER: 'beestoon-api', JWT_AUDIENCE: 'beestoon-editor', CORS_ORIGINS: SITE,
             INVITE_BASE_URL: `${SITE}/editor`, CREDITS_PROVIDER: 'beestoon',
-            BEESTOON_API_URL: 'https://api.site.test', EDITOR_SERVICE_KEY: SERVICE_KEY }), []);
+            BEESTOON_API_URL: 'https://api.site.test', EDITOR_SERVICE_KEY: SERVICE_KEY, EDITOR_ACCESS: 'beestoon' }), []);
     });
 
 

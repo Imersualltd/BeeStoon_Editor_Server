@@ -18,6 +18,8 @@ import { registerMySessionsRoutes } from './my-sessions.mjs';
 import { registerCreditRoutes } from './credits.mjs';
 import { allowedOrigins, originFor } from './cors.mjs';
 import { registerInternalRoutes } from './internal.mjs';
+import { startAccessRecheck } from './editor-access.mjs';
+import { liveRooms } from './sessions.mjs';
 
 
 const PORT = Number(process.env.PORT) || 2567;
@@ -128,4 +130,5 @@ const server = defineServer({
 
 server.listen(PORT, HOST).then(() => {
     console.log(`Multiplayer server listening on ${HOST}:${PORT}`);
+    startAccessRecheck(liveRooms);
 });

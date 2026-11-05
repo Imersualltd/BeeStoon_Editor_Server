@@ -130,6 +130,8 @@
  * Leave codes the client can show:
  *   4101 kicked, 4102 denied, 4103 session closed,
  *   4105 taken out after IDLE_MINUTES without activity,
+ *   4106 editor access removed from the account
+ *        (editor-access.mjs),
  *   4104 opened in another tab/window (no longer sent:
  *   several browsers are allowed)
  *
@@ -165,6 +167,7 @@ import { randomBytes, randomUUID } from 'node:crypto';
 import { Room, ServerError } from 'colyseus';
 
 import { getAuthAdapter } from './auth/index.mjs';
+import { ACCESS_REMOVED_CODE, AccessError, requireAccess } from './editor-access.mjs';
 import { cleanEmail } from './auth/util.mjs';
 import { mailerReady, sendInvite } from './mailer.mjs';
 import { ASSET_ID_PATTERN, blobKey, SCENE_ID_PATTERN, textureKey } from './assets.mjs';
@@ -456,6 +459,17 @@ export class ModelRoom extends Room {
 
         if (this.banned.has(identity.userId)) {
             throw new ServerError(403, 'You were removed from this session');
+        }
+
+        // The BeeStoon account must have editor access. An
+        // invite or a role in this session never replaces it.
+        try {
+            await requireAccess(identity.userId);
+        } catch (error) {
+            if (error instanceof AccessError) {
+                throw new ServerError(error.status, error.message);
+            }
+            throw error;
         }
 
         // Only the owner opens a saved session again
@@ -2919,6 +2933,37 @@ export class ModelRoom extends Room {
     actionDenied(client, type, reason) {
 
         client.send('action:denied', { type, reason });
+    }
+
+
+    /*
+     * Editor access was removed from this person's account
+     * (editor-access.mjs): every browser leaves and every
+     * download ticket stops working. The role stays with
+     * the session, so access ticked again lets them back.
+     * Returns true when someone was connected.
+     */
+    removeForAccess(userId, reason) {
+
+        const user = this.users.get(userId);
+
+        if (!user) {
+            return false;
+        }
+
+        revokeTickets(this, userId);
+        user.ticket = null;
+
+        if (!user.clients.size && !user.dropped.size) {
+            return false;
+        }
+
+        console.log(`[${this.roomId}] editor access ended for "${user.name}"`);
+
+        this.disconnectUser(user, ACCESS_REMOVED_CODE, reason);
+        this.afterUserGone(user);
+
+        return true;
     }
 
 

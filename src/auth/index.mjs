@@ -82,6 +82,10 @@ export function productionProblems(env = process.env) {
         problems.push('credits must use CREDITS_PROVIDER=beestoon (or CREDITS_ENABLED=false)');
     }
 
+    if ((env.EDITOR_ACCESS || 'open').toLowerCase() !== 'beestoon') {
+        problems.push('EDITOR_ACCESS must be beestoon (editor access from the BeeStoon account)');
+    }
+
     if (env.ASSET_DOWNLOAD_AUTH === 'open') {
         problems.push('ASSET_DOWNLOAD_AUTH=open is for development only');
     }

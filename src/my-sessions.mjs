@@ -20,6 +20,7 @@
  */
 
 import { getAuthAdapter } from './auth/index.mjs';
+import { requireAccess } from './editor-access.mjs';
 import { setCorsOrigin } from './cors.mjs';
 import { deleteScene, sceneOfKey, scenesOfUser } from './scene-versions.mjs';
 import { liveRoomOf, liveRooms, SESSION_KEY_PATTERN } from './sessions.mjs';
@@ -71,12 +72,23 @@ export async function identify(req, res) {
         // checked by the adapter
     }
 
+    let me;
+
     try {
-        return await getAuthAdapter().verify({ token, options: { identity } });
+        me = await getAuthAdapter().verify({ token, options: { identity } });
     } catch (error) {
         res.status(401).send(`Login failed: ${error.message}`);
         return null;
     }
+
+    try {
+        await requireAccess(me.userId);
+    } catch (error) {
+        res.status(error.status || 503).send(error.message);
+        return null;
+    }
+
+    return me;
 }
 
 
