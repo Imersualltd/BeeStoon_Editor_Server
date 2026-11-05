@@ -13,6 +13,10 @@ services:
       # Development: trust the name the client sends.
       # Switch to AUTH_PROVIDER=jwt (+ JWT_SECRET or
       # JWT_PUBLIC_KEY) for the BeeStoon build.
+      # The image sets NODE_ENV=production; this development
+      # service skips the production checks on purpose.
+      - key: EDITOR_DEPLOYMENT
+        value: development
       - key: AUTH_PROVIDER
         value: dev
       - key: ALLOW_DEV_AUTH
