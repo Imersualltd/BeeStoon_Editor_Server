@@ -5,25 +5,64 @@ services:
     # tool needed for GLB -> FBX export (see Dockerfile).
     runtime: docker
     dockerfilePath: ./Dockerfile
+    # Free plan: sleeps after ~15 minutes without traffic,
+    # the next visitor waits for a cold start (see the
+    # BeeStoon release notes). Saved sessions live in
+    # Spaces (SCENE_STORAGE=s3), never on this machine.
     plan: free
     # Closest Render region to Europe / Middle East
     region: frankfurt
     healthCheckPath: /health
     envVars:
-      # Development: trust the name the client sends.
-      # Switch to AUTH_PROVIDER=jwt (+ JWT_SECRET or
-      # JWT_PUBLIC_KEY) for the BeeStoon build.
-      # The image sets NODE_ENV=production; this development
-      # service skips the production checks on purpose.
-      - key: EDITOR_DEPLOYMENT
-        value: development
+      # BeeStoon pilot (https://beestoon.ai/editor): the
+      # BeeStoon login only, and only accounts with the
+      # "Editor access" tick. The server refuses to start if
+      # the dev login comes back (accessProblems).
       - key: AUTH_PROVIDER
-        value: dev
-      - key: ALLOW_DEV_AUTH
-        value: "true"
-      # AR share links: "local" until DigitalOcean Spaces
-      # is set up (then AR_STORAGE=s3 + S3_* keys, see README)
-      - key: AR_STORAGE
-        value: local
-      - key: AR_LINK_HOURS
-        value: "24"
+        value: jwt
+      - key: JWT_ISSUER
+        value: beestoon-api
+      - key: JWT_AUDIENCE
+        value: beestoon-editor
+      - key: JWT_SECRET            # = backend EDITOR_JWT_SECRET
+        sync: false
+      - key: EDITOR_ACCESS
+        value: beestoon
+      - key: EDITOR_ACCESS_RECHECK_SECONDS
+        value: "30"
+      - key: BEESTOON_API_URL
+        value: https://api.beestoon.ai
+      - key: EDITOR_SERVICE_KEY    # = backend EDITOR_SERVICE_KEY
+        sync: false
+      - key: CORS_ORIGINS
+        value: https://beestoon.ai
+      - key: INVITE_BASE_URL
+        value: https://beestoon.ai/editor
+      - key: PUBLIC_BASE_URL
+        value: https://be-water-multiplayer.onrender.com
+      # Pilot: no editor charges (prices not confirmed),
+      # no public anonymous AR links, invites only logged
+      - key: CREDITS_PROVIDER
+        value: beestoon
+      - key: CREDITS_ENABLED
+        value: "false"
+      # EDITOR_PAID_FEATURES unset: every paid editor feature is off
+      - key: AR_SHARING
+        value: "off"
+      - key: MAIL_PROVIDER
+        value: log
+      # Saved sessions and model files: Spaces
+      - key: SCENE_STORAGE
+        value: s3
+      - key: S3_ENDPOINT
+        value: https://lon1.digitaloceanspaces.com
+      - key: S3_REGION
+        value: lon1
+      - key: S3_BUCKET             # the editor bucket you choose
+        sync: false
+      - key: S3_ACCESS_KEY_ID      # a key limited to that bucket
+        sync: false
+      - key: S3_SECRET_ACCESS_KEY
+        sync: false
+      - key: SCENE_S3_PREFIX
+        value: editor-scenes/
