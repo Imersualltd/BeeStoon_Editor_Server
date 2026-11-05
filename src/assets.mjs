@@ -34,6 +34,11 @@
  * They live in scene storage (scene-storage.mjs) under
  * <sceneId>/blobs/<assetId>.glb.
  *
+ * Texture images for material edits (materials.mjs) use the
+ * same routes with ?kind=texture (PNG, JPEG or WebP; same
+ * size limits; counted in the session total) and are served
+ * from GET /assets/<sceneId>/<textureId>.tex, members only.
+ *
  * The sceneId is a long random id, made when the
  * session starts. Public sharing is a separate step:
  * an AR link (ar-share.mjs).
@@ -62,6 +67,31 @@ const GLB_MAGIC = 0x46546C67;          // "glTF"
 export const SCENE_ID_PATTERN = /^[A-Za-z0-9_-]{20,64}$/;
 
 export const ASSET_ID_PATTERN = /^[0-9a-f]{64}$/;
+
+
+export function textureKey(sceneId, textureId) {
+
+    return `${sceneId}/blobs/${textureId}.tex`;
+}
+
+
+// PNG, JPEG or WebP by their first bytes, else null
+export function imageType(body) {
+
+    if (body.length > 8 && body.readUInt32BE(0) === 0x89504E47) {
+        return 'image/png';
+    }
+
+    if (body.length > 3 && body[0] === 0xFF && body[1] === 0xD8 && body[2] === 0xFF) {
+        return 'image/jpeg';
+    }
+
+    if (body.length > 12 && body.toString('ascii', 0, 4) === 'RIFF' && body.toString('ascii', 8, 12) === 'WEBP') {
+        return 'image/webp';
+    }
+
+    return null;
+}
 
 
 export function blobKey(sceneId, assetId) {
@@ -143,6 +173,10 @@ async function handleUpload(req, res, storage) {
         return;
     }
 
+    if (req.query.kind === 'texture') {
+        return handleTextureUpload(req, res, storage, room, body);
+    }
+
     if (body.readUInt32LE(0) !== GLB_MAGIC || body.readUInt32LE(4) !== 2) {
         res.status(415).send('Not a GLB (glTF 2.0 binary) file');
         return;
@@ -181,9 +215,75 @@ async function handleUpload(req, res, storage) {
 }
 
 
+async function handleTextureUpload(req, res, storage, room, body) {
+
+    if (!imageType(body)) {
+        res.status(415).send('A texture must be a PNG, JPEG or WebP image');
+        return;
+    }
+
+    const textureId = createHash('sha256').update(body).digest('hex');
+
+    const reason = room.textureDenial(textureId, body.length);
+
+    if (reason) {
+        res.status(413).send(reason);
+        return;
+    }
+
+    const key = textureKey(room.sceneId, textureId);
+
+    if (!(await storage.exists(key))) {
+        await storage.put(key, body);
+    }
+
+    room.registerTexture(textureId, body.length);
+
+    res.json({ textureId, size: body.length, url: `${baseUrl(req)}/assets/${room.sceneId}/${textureId}.tex` });
+}
+
+
+async function handleTextureDownload(req, res, storage, sceneId, textureId) {
+
+    const key = textureKey(sceneId, textureId);
+
+    const signed = await storage.signedUrl(key, SIGNED_URL_SECONDS);
+
+    if (signed) {
+        res.setHeader('Cache-Control', 'no-store');
+        res.redirect(302, signed);
+        return;
+    }
+
+    const body = await storage.get(key);
+
+    if (!body) {
+        res.status(404).send('Not found');
+        return;
+    }
+
+    res.setHeader('Content-Type', imageType(body) || 'application/octet-stream');
+    res.setHeader('Content-Length', String(body.length));
+    res.setHeader('Cache-Control', 'private, max-age=31536000, immutable');
+    res.send(body);
+}
+
+
 async function handleDownload(req, res, storage) {
 
     const { sceneId, file } = req.params;
+
+    if (file.endsWith('.tex')) {
+
+        const textureId = file.slice(0, -4);
+
+        if (!SCENE_ID_PATTERN.test(sceneId) || !ASSET_ID_PATTERN.test(textureId)) {
+            res.status(404).send('Not found');
+            return;
+        }
+
+        return handleTextureDownload(req, res, storage, sceneId, textureId);
+    }
 
     const assetId = file.endsWith('.glb') ? file.slice(0, -4) : '';
 

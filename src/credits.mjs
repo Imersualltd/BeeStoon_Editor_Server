@@ -69,6 +69,43 @@ export function creditsProvider() {
 }
 
 
+/*
+ * Paid editor features with real BeeStoon credits stay OFF
+ * until their prices are confirmed: EDITOR_PAID_FEATURES is
+ * a comma list of
+ *   sessions  start a new session (type price + pool)
+ *   entry     join someone else's session
+ *   upgrade   Single -> Multi Basic -> Multi Pro
+ *   pool      put credits in a session pool (and let it pay)
+ * A feature that is off is refused, never given away free.
+ * With local test wallets (development) everything is on.
+ */
+export const PAID_FEATURES = ['sessions', 'entry', 'upgrade', 'pool'];
+
+export function paidFeatureEnabled(name) {
+
+    if (!creditsEnabled() || creditsProvider() !== 'beestoon') {
+        return true;
+    }
+
+    return String(process.env.EDITOR_PAID_FEATURES || '')
+        .split(',')
+        .map((f) => f.trim().toLowerCase())
+        .includes(name);
+}
+
+
+export function paidFeatureMessage(name) {
+
+    return {
+        sessions: 'Starting new editor sessions is not available yet.',
+        entry: 'Joining editor sessions is not available yet.',
+        upgrade: 'Changing the session type is not available yet.',
+        pool: 'Session credit pools are not available yet.'
+    }[name];
+}
+
+
 // generation:charge (the editor's own model price) only
 // without BeeStoon: there BeeStoon prices the model
 export function generationChargeEnabled() {

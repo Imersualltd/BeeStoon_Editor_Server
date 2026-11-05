@@ -21,9 +21,23 @@
  * The BeeStoon backend asks this before it shows a
  * session's image library or links a generation to a
  * session. A session key alone is never enough.
+ *
+ * POST /internal/sessions/<sessionKey>/pool/spend
+ *   { userId, amount, key }
+ *   The backend asks whether the session pool pays one
+ *   BeeStoon purchase (a model import) for this member.
+ *   Only a live session, only when the admin let the pool
+ *   pay for models, only with enough left. The same key
+ *   never spends twice.
+ *   -> { paid: true, left }  |  { paid: false, reason }
+ * POST /internal/sessions/<sessionKey>/pool/refund { key }
+ *   The purchase did not go through: the pool gets the
+ *   credits of that key back (once).
  */
 
 import { timingSafeEqual } from 'node:crypto';
+
+import express from 'express';
 
 import { sceneOfKey } from './scene-versions.mjs';
 import { liveRoomOf, SESSION_KEY_PATTERN } from './sessions.mjs';
@@ -80,7 +94,58 @@ export async function membershipOf(sessionKey, userId) {
 }
 
 
+const SPEND_KEY_PATTERN = /^[A-Za-z0-9:_-]{8,120}$/;
+
+
 export function registerInternalRoutes(app) {
+
+    app.post('/internal/sessions/:sessionKey/pool/:action', express.json({ limit: '4kb' }), async (req, res) => {
+
+        res.setHeader('Cache-Control', 'no-store');
+
+        if (!serviceKeyOk(req)) {
+            res.status(404).end();
+            return;
+        }
+
+        const { sessionKey, action } = req.params;
+        const { userId, amount, key } = req.body || {};
+
+        if (!SESSION_KEY_PATTERN.test(sessionKey) || !SPEND_KEY_PATTERN.test(String(key || '')) ||
+            !['spend', 'refund'].includes(action)) {
+            res.status(400).json({ error: 'Not a valid pool request' });
+            return;
+        }
+
+        const room = liveRoomOf(sessionKey);
+
+        if (action === 'refund') {
+            res.json({ refunded: !!room && room.refundPool(key) });
+            return;
+        }
+
+        if (!Number.isInteger(amount) || amount < 1 || amount > 10000 || !USER_ID_PATTERN.test(String(userId || ''))) {
+            res.status(400).json({ error: 'Not a valid pool request' });
+            return;
+        }
+
+        if (!room || room.closed) {
+            res.json({ paid: false, reason: 'not_live' });
+            return;
+        }
+
+        if (!(await membershipOf(sessionKey, userId))) {
+            res.status(403).json({ paid: false, reason: 'not_member' });
+            return;
+        }
+
+        const result = room.spendPool(amount, key);
+
+        console.log(`[pool] ${sessionKey} ${key}: ${result.paid ? `paid ${amount}` : result.reason}`);
+
+        res.json(result);
+    });
+
 
     app.get('/internal/sessions/:sessionKey/members/:userId', async (req, res) => {
 

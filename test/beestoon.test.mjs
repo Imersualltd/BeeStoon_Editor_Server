@@ -110,6 +110,8 @@ const server = spawn(process.execPath, ['src/index.mjs'], {
         JWT_AUDIENCE: 'beestoon-editor',
         CORS_ORIGINS: SITE,
         CREDITS_PROVIDER: 'beestoon',
+        // Prices confirmed (the default is all off, see pool.test.mjs)
+        EDITOR_PAID_FEATURES: 'sessions,entry,upgrade,pool',
         BEESTOON_API_URL: LEDGER,
         EDITOR_SERVICE_KEY: SERVICE_KEY,
         MAIL_PROVIDER: 'capture',

@@ -278,6 +278,8 @@ export function saveVersion(info, objects, version) {
                 size,
                 url,
                 transform: object.transform,
+                // Material edits (materials.mjs); the GLB is unchanged
+                materials: object.materials || {},
                 addedBy: object.addedBy,
                 assignedTo: object.assignedTo
             });

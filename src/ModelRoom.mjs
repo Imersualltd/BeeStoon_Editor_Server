@@ -31,6 +31,17 @@
  *     'object:remove'     { id }
  *     'object:hold'       { id }
  *     'object:release'    { id }
+ *     'object:material'   { id, index, patch }   material/texture
+ *                         edit of one material of the model (see
+ *                         materials.mjs); patch null = back to the
+ *                         model's own material. Same edit rights and
+ *                         holds as a transform. Everyone gets the full
+ *                         set: 'object:materials' { id, materials },
+ *                         also on join and after a version restore.
+ *                         Saved with every version; the GLB file is
+ *                         never changed.
+ *     'credits:refresh'   {}  re-read my balance (after a BeeStoon
+ *                         purchase or import), new session:state
  *     'sync-request'      { have?: [id, ...] }
  *     'session:leave'     { choice?: 'close'|'keep'|'assign', newAdminId? }
  *                         (when the last online admin leaves
@@ -156,13 +167,15 @@ import { Room, ServerError } from 'colyseus';
 import { getAuthAdapter } from './auth/index.mjs';
 import { cleanEmail } from './auth/util.mjs';
 import { mailerReady, sendInvite } from './mailer.mjs';
-import { ASSET_ID_PATTERN, blobKey, SCENE_ID_PATTERN } from './assets.mjs';
+import { ASSET_ID_PATTERN, blobKey, SCENE_ID_PATTERN, textureKey } from './assets.mjs';
 import { SESSION_TYPES, sessionTypeOf, upgradeCost } from './session-types.mjs';
 import { getSceneStorage } from './scene-storage.mjs';
 import {
     balanceOf, charge, creditsEnabled, ENTRY_COST, generationChargeEnabled,
-    generationCost, MAX_POOL, poolFromOptions, SESSION_COSTS
+    generationCost, MAX_POOL, PAID_FEATURES, paidFeatureEnabled, paidFeatureMessage,
+    poolFromOptions, SESSION_COSTS
 } from './credits.mjs';
+import { cleanMaterials, cleanMaterialPatch, mergeMaterial, texturesOf } from './materials.mjs';
 import {
     cleanText,
     latestVersion,
@@ -248,6 +261,15 @@ export const LEAVE_CODES = {
 const SERVER_ID = randomUUID();
 
 
+// Pool spend keys kept for idempotency: the newest 500
+export function trimSpends(spends) {
+
+    const entries = Object.entries(spends);
+
+    return Object.fromEntries(entries.slice(-500));
+}
+
+
 export class ModelRoom extends Room {
 
     // Session ends (room is disposed) when everyone
@@ -331,6 +353,10 @@ export class ModelRoom extends Room {
         // assetId -> { size, url }: files uploaded for this
         // session, the only ones object:add may use
         this.uploads = new Map();
+
+        // textureId -> size: texture images uploaded for this
+        // session, the only ones a material edit may use
+        this.textures = new Map();
 
         // userId -> { userId, name, email, role, status,
         //             joinedAt, online, clients, dropped }
@@ -471,6 +497,14 @@ export class ModelRoom extends Room {
         // and the pool
         if (!this.hasCreator && !this.creatorCharged) {
 
+            if (!paidFeatureEnabled('sessions')) {
+                throw new ServerError(403, paidFeatureMessage('sessions'));
+            }
+
+            if (this.credits.total && !paidFeatureEnabled('pool')) {
+                throw new ServerError(403, paidFeatureMessage('pool'));
+            }
+
             const cost = SESSION_COSTS[this.sessionType] + this.credits.total;
 
             this.creatorCharged = true;
@@ -499,6 +533,10 @@ export class ModelRoom extends Room {
         // Here before, a second browser, or the owner
         if (this.entryPaid.has(userId) || this.users.has(userId) || userId === this.owner?.userId) {
             return;
+        }
+
+        if (!paidFeatureEnabled('entry')) {
+            throw new ServerError(403, paidFeatureMessage('entry'));
         }
 
         // Invited by email: in straight away, so pay now
@@ -598,6 +636,61 @@ export class ModelRoom extends Room {
     chargeKey(what) {
 
         return `editor:${this.sceneId}:${what}`;
+    }
+
+
+    /*
+     * The pool pays a BeeStoon purchase (internal.mjs, asked by
+     * the backend for a model import) when the admin let it pay
+     * for models and it has enough left. `key` names the
+     * purchase: the same key never spends twice (kept with the
+     * pool, so also in a saved session). Synchronous: no other
+     * spend can run between the check and the deduction.
+     * -> { paid, left, replayed? } or { paid: false, reason }
+     */
+    spendPool(amount, key) {
+
+        const spends = this.credits.spends || {};
+
+        if (spends[key] !== undefined) {
+            return { paid: true, left: this.credits.left, replayed: true };
+        }
+
+        if (!paidFeatureEnabled('pool') || !this.credits.forModels) {
+            return { paid: false, reason: 'pool_off' };
+        }
+
+        if (this.credits.left < amount) {
+            return { paid: false, reason: 'pool_low' };
+        }
+
+        this.credits.left -= amount;
+        this.credits.spends = trimSpends({ ...spends, [key]: amount });
+
+        this.poolChanged();
+        this.sendState();
+
+        return { paid: true, left: this.credits.left };
+    }
+
+
+    // A purchase the pool paid did not go through after all
+    refundPool(key) {
+
+        const spends = { ...(this.credits.spends || {}) };
+
+        if (spends[key] === undefined) {
+            return false;
+        }
+
+        this.credits.left += spends[key];
+        delete spends[key];
+        this.credits.spends = spends;
+
+        this.poolChanged();
+        this.sendState();
+
+        return true;
     }
 
 
@@ -974,6 +1067,7 @@ export class ModelRoom extends Room {
                 transform: isValidTransform(data.transform)
                     ? pickTransform(data.transform)
                     : null,
+                materials: previous && previous.assetId === data.assetId ? previous.materials || {} : {},
                 addedBy: previous ? previous.addedBy : user.userId,
                 assignedTo: previous ? previous.assignedTo : null,
                 heldBy: previous ? previous.heldBy : null,
@@ -1000,6 +1094,73 @@ export class ModelRoom extends Room {
             this.sendApproved('object:add', object, client);
 
             this.sendState();
+        });
+
+
+        // Material / texture edit of one material of a model
+        this.onApproved('object:material', (client, user, data) => {
+
+            const object = isValidId(data?.id) ? this.objects.get(data.id) : null;
+            const index = Number(data?.index);
+
+            if (!object || !Number.isInteger(index)) {
+                return;
+            }
+
+            const reason = this.editDenial(user, object);
+
+            if (reason) {
+                this.deny(client, object.id, reason, object);
+                client.send('object:materials', { id: object.id, materials: object.materials || {} });
+                return;
+            }
+
+            const patch = data.patch === null ? null : cleanMaterialPatch(data.patch, this.textures);
+
+            if (data.patch !== null && !patch) {
+                client.send('object:materials', { id: object.id, materials: object.materials || {} });
+                return this.actionDenied(client, 'object:material', 'Not a valid material edit');
+            }
+
+            const materials = mergeMaterial(object.materials || {}, index, patch);
+
+            if (!materials) {
+                return this.actionDenied(client, 'object:material', 'Not a valid material edit');
+            }
+
+            // An editor who changes a free object holds it
+            if (user.role === 'editor' && !object.heldBy) {
+                object.heldBy = user.userId;
+                this.sendState();
+            }
+
+            object.materials = materials;
+
+            this.markDirty();
+
+            this.sendApproved('object:materials', { id: object.id, materials }, client);
+
+            // Textures change the session's storage use
+            if (patch === null || patch.maps) {
+                this.sendState();
+            }
+        });
+
+
+        this.onApproved('credits:refresh', async (client, user) => {
+
+            if (!creditsEnabled() || Date.now() - (user.creditsReadAt || 0) < 3000) {
+                return;
+            }
+
+            user.creditsReadAt = Date.now();
+
+            const balance = await balanceOf(user.userId);
+
+            if (balance !== null && balance !== undefined) {
+                user.balance = balance;
+                this.sendState();
+            }
         });
 
 
@@ -1239,6 +1400,10 @@ export class ModelRoom extends Room {
         // Put more of the admin's credits into the pool
         this.onAdmin('credits:add', async (client, admin, data) => {
 
+            if (!paidFeatureEnabled('pool')) {
+                return this.actionDenied(client, 'credits:add', paidFeatureMessage('pool'));
+            }
+
             const amount = Math.floor(Number(data?.amount));
 
             if (!creditsEnabled() || !Number.isFinite(amount) || amount < 1 ||
@@ -1266,6 +1431,14 @@ export class ModelRoom extends Room {
 
         // Upgrade the session type (single -> basic -> workshop)
         this.onAdmin('session:upgrade', async (client, admin, data) => {
+
+            if (!paidFeatureEnabled('upgrade')) {
+                return this.actionDenied(client, 'session:upgrade', paidFeatureMessage('upgrade'));
+            }
+
+            if (data?.creditPool && !paidFeatureEnabled('pool')) {
+                return this.actionDenied(client, 'session:upgrade', paidFeatureMessage('pool'));
+            }
 
             const to = data?.to;
             const from = this.sessionType;
@@ -1386,6 +1559,10 @@ export class ModelRoom extends Room {
 
         // What the pool pays for
         this.onAdmin('credits:pool', (client, admin, data) => {
+
+            if (!paidFeatureEnabled('pool')) {
+                return this.actionDenied(client, 'credits:pool', paidFeatureMessage('pool'));
+            }
 
             if (typeof data?.forEntry === 'boolean') {
                 this.credits.forEntry = data.forEntry;
@@ -2018,6 +2195,10 @@ export class ModelRoom extends Room {
                 continue;
             }
 
+            for (const textureId of texturesOf(object.materials)) {
+                files.set(textureId, this.textures.get(textureId) || 0);
+            }
+
             if (object.assetId) {
                 files.set(object.assetId, object.size);
             } else if (object.dataUrl) {
@@ -2060,6 +2241,27 @@ export class ModelRoom extends Room {
         }
 
         return null;
+    }
+
+
+    // Over the session's limit with this texture?
+    textureDenial(textureId, size) {
+
+        if (size > this.limits.fileBytes) {
+            return `A texture can be at most ${mb(this.limits.fileBytes)} MB in this session type`;
+        }
+
+        if (!this.textures.has(textureId) && this.usedBytes() + size > this.limits.maxBytes) {
+            return `This session has room for ${mb(this.limits.maxBytes)} MB of files and is full`;
+        }
+
+        return null;
+    }
+
+
+    registerTexture(textureId, size) {
+
+        this.textures.set(textureId, size);
     }
 
 
@@ -2301,12 +2503,25 @@ export class ModelRoom extends Room {
                 size: o.size,
                 url,
                 transform: isValidTransform(o.transform) ? pickTransform(o.transform) : null,
+                materials: cleanMaterials(o.materials),
                 addedBy: o.addedBy ?? null,
                 // Kept: people come back with the same id
                 // (an admin can unassign)
                 assignedTo: o.assignedTo ?? null,
                 heldBy: null
             });
+        }
+
+        // Texture files the saved materials use
+        for (const object of objects.values()) {
+            for (const textureId of texturesOf(object.materials)) {
+                if (!this.textures.has(textureId)) {
+                    const size = await getSceneStorage().sizeOf(textureKey(this.sceneId, textureId)).catch(() => null);
+                    if (size !== null) {
+                        this.textures.set(textureId, size);
+                    }
+                }
+            }
         }
 
         this.objects = objects;
@@ -2371,6 +2586,10 @@ export class ModelRoom extends Room {
 
                 if (next.transform) {
                     this.sendApproved('object:transform', { id: next.id, ...next.transform });
+                }
+
+                if (JSON.stringify(old.materials || {}) !== JSON.stringify(next.materials || {})) {
+                    this.sendApproved('object:materials', { id: next.id, materials: next.materials || {} });
                 }
 
             } else {
@@ -2611,9 +2830,13 @@ export class ModelRoom extends Room {
                 // scene:save / scene:versions / scene:restore
                 versions: true,
                 // credits:add / credits:pool (admins)
-                credits: creditsEnabled(),
+                credits: creditsEnabled() && paidFeatureEnabled('pool'),
                 // session:upgrade (admins)
-                sessionUpgrade: true,
+                sessionUpgrade: paidFeatureEnabled('upgrade'),
+                // object:material (material/texture sync)
+                materials: true,
+                // Paid features switched on (prices confirmed)
+                paid: Object.fromEntries(PAID_FEATURES.map((f) => [f, paidFeatureEnabled(f)])),
                 // generation:charge (BeeStoon AI); off when
                 // BeeStoon prices the model itself
                 generationCharge: generationChargeEnabled()
