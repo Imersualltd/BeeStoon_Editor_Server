@@ -168,6 +168,7 @@ import { Room, ServerError } from 'colyseus';
 
 import { getAuthAdapter } from './auth/index.mjs';
 import { ACCESS_REMOVED_CODE, AccessError, requireAccess } from './editor-access.mjs';
+import { arSharingEnabled } from './ar-share.mjs';
 import { cleanEmail } from './auth/util.mjs';
 import { mailerReady, sendInvite } from './mailer.mjs';
 import { ASSET_ID_PATTERN, blobKey, SCENE_ID_PATTERN, textureKey } from './assets.mjs';
@@ -439,6 +440,37 @@ export class ModelRoom extends Room {
     // ==============================================
     // IDENTITY
     // ==============================================
+
+    /*
+     * Matchmaking (POST /matchmake/...) calls this before it
+     * creates a room or reserves a seat: a valid login and
+     * editor access, or nothing is allocated. Returning true
+     * (not the identity) keeps the instance onAuth below,
+     * which checks again on connect together with the
+     * session's own rules (removed, full, owner-only, credits).
+     */
+    static async onAuth(token, options, context) {
+
+        let identity;
+
+        try {
+            identity = await getAuthAdapter().verify({ token, options });
+        } catch (error) {
+            throw new ServerError(401, `Login failed: ${error.message}`);
+        }
+
+        try {
+            await requireAccess(identity.userId);
+        } catch (error) {
+            if (error instanceof AccessError) {
+                throw new ServerError(error.status, error.message);
+            }
+            throw error;
+        }
+
+        return true;
+    }
+
 
     async onAuth(client, options, context) {
 
@@ -2852,6 +2884,8 @@ export class ModelRoom extends Room {
                 sessionUpgrade: paidFeatureEnabled('upgrade'),
                 // object:material (material/texture sync)
                 materials: true,
+                // POST /ar/snapshots (public AR links; AR_SHARING)
+                arShare: arSharingEnabled(),
                 // Paid features switched on (prices confirmed)
                 paid: Object.fromEntries(PAID_FEATURES.map((f) => [f, paidFeatureEnabled(f)])),
                 // generation:charge (BeeStoon AI); off when

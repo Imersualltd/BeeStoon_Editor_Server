@@ -20,6 +20,11 @@
  *     connected person leaves too (access unknown = no
  *     access)
  *
+ *   - matchmaking asks too (ModelRoom.onAuth, static):
+ *     no room is created and no seat reserved for an
+ *     anonymous or unticked account, also when someone
+ *     calls /matchmake directly
+ *
  * EDITOR_ACCESS=open (default, development): no check.
  *
  * Access is not a role and not a payment: roles still
@@ -39,6 +44,37 @@ export function accessMode(env = process.env) {
 export function accessChecked(env = process.env) {
 
     return accessMode(env) === 'beestoon';
+}
+
+
+/*
+ * With EDITOR_ACCESS=beestoon the login must be the
+ * BeeStoon token, whatever else is set (also with
+ * EDITOR_DEPLOYMENT=development): a dashboard or
+ * blueprint change that brings the dev login back makes
+ * the server refuse to start instead of letting anyone in.
+ */
+export function accessProblems(env = process.env) {
+
+    if (!accessChecked(env)) {
+        return [];
+    }
+
+    const problems = [];
+
+    if ((env.AUTH_PROVIDER || 'dev').toLowerCase() !== 'jwt') {
+        problems.push('EDITOR_ACCESS=beestoon needs AUTH_PROVIDER=jwt');
+    }
+
+    if (env.ALLOW_DEV_AUTH === 'true') {
+        problems.push('EDITOR_ACCESS=beestoon cannot run with ALLOW_DEV_AUTH=true');
+    }
+
+    if (!env.BEESTOON_API_URL || String(env.EDITOR_SERVICE_KEY || '').length < 32) {
+        problems.push('EDITOR_ACCESS=beestoon needs BEESTOON_API_URL and EDITOR_SERVICE_KEY (32+ characters)');
+    }
+
+    return problems;
 }
 
 

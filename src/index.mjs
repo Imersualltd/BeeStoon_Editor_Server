@@ -18,7 +18,7 @@ import { registerMySessionsRoutes } from './my-sessions.mjs';
 import { registerCreditRoutes } from './credits.mjs';
 import { allowedOrigins, originFor } from './cors.mjs';
 import { registerInternalRoutes } from './internal.mjs';
-import { startAccessRecheck } from './editor-access.mjs';
+import { accessProblems, startAccessRecheck } from './editor-access.mjs';
 import { liveRooms } from './sessions.mjs';
 
 
@@ -30,14 +30,15 @@ const HOST = process.env.HOST || '0.0.0.0';
 
 
 // Unsafe production settings stop the server at start-up
-const problems = productionProblems();
+// (accessProblems also with EDITOR_DEPLOYMENT=development)
+const problems = [...productionProblems(), ...accessProblems()];
 
 if (process.env.NODE_ENV === 'production' && process.env.EDITOR_DEPLOYMENT === 'development') {
     console.warn('EDITOR_DEPLOYMENT=development: production safety checks are OFF (development service only)');
 }
 
 if (problems.length) {
-    console.error(`Refusing to start in production:\n  - ${problems.join('\n  - ')}`);
+    console.error(`Refusing to start:\n  - ${problems.join('\n  - ')}`);
     process.exit(1);
 }
 

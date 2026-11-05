@@ -14,11 +14,15 @@
  *     lets him back with the same role
  *   - the API not answering: no new joins, and after
  *     two failed rechecks everyone connected leaves
+ *   - matchmaking (also a direct POST /matchmake) creates
+ *     no room for anonymous or unticked accounts
+ *   - public AR share links are off (routes 404,
+ *     features.arShare=false)
  *
  *   node test/editor-access.test.mjs
  */
 
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { createServer } from 'node:http';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -28,6 +32,9 @@ import assert from 'node:assert/strict';
 
 import jwt from 'jsonwebtoken';
 import { Client } from '@colyseus/sdk';
+
+import { accessProblems } from '../src/editor-access.mjs';
+import { arSharingEnabled } from '../src/ar-share.mjs';
 
 
 const PORT = 3600 + Math.floor(Math.random() * 300);
@@ -177,6 +184,18 @@ async function mine(name) {
 }
 
 
+async function matchmake(raw, sessionKey, method = 'joinOrCreate') {
+    const res = await fetch(`${SERVER}/matchmake/${method}/session`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...(raw ? { Authorization: `Bearer ${raw}` } : {}) },
+        body: JSON.stringify({ sessionKey, sessionType: 'basic' })
+    });
+    return { status: res.status, json: await res.json().catch(() => null) };
+}
+
+const created = (key) => serverLog.includes(`session ${key} created`);
+
+
 async function members(userId) {
     const res = await fetch(`${SERVER}/internal/sessions/${KEY}/members/${encodeURIComponent(userId)}`, {
         headers: { 'X-Editor-Service-Key': SERVICE_KEY }
@@ -194,10 +213,74 @@ async function main() {
     });
 
 
+    console.log('\nSettings');
+
+    check('EDITOR_ACCESS=beestoon refuses the dev login, also on a development deployment', () => {
+        const dev = { EDITOR_ACCESS: 'beestoon', EDITOR_DEPLOYMENT: 'development', AUTH_PROVIDER: 'dev', ALLOW_DEV_AUTH: 'true',
+            BEESTOON_API_URL: API, EDITOR_SERVICE_KEY: SERVICE_KEY };
+        const problems = accessProblems(dev);
+        assert.ok(problems.some((p) => p.includes('AUTH_PROVIDER=jwt')));
+        assert.ok(problems.some((p) => p.includes('ALLOW_DEV_AUTH')));
+        assert.deepEqual(accessProblems({ ...dev, AUTH_PROVIDER: 'jwt', ALLOW_DEV_AUTH: undefined }), []);
+        assert.deepEqual(accessProblems({ AUTH_PROVIDER: 'dev' }), []);   // development without access: unchanged
+    });
+
+    check('AR share links default to off with editor access, on without it; AR_SHARING decides when set', () => {
+        assert.equal(arSharingEnabled({ EDITOR_ACCESS: 'beestoon' }), false);
+        assert.equal(arSharingEnabled({}), true);
+        assert.equal(arSharingEnabled({ EDITOR_ACCESS: 'beestoon', AR_SHARING: 'on' }), true);
+        assert.equal(arSharingEnabled({ AR_SHARING: 'off' }), false);
+    });
+
+
+    // What a blueprint sync back to the old render.yaml would leave behind
+    const reverted = spawnSync(process.execPath, ['src/index.mjs'], {
+        env: { ...process.env, PORT: String(PORT + 1), NODE_ENV: 'production', EDITOR_DEPLOYMENT: 'development',
+            AUTH_PROVIDER: 'dev', ALLOW_DEV_AUTH: 'true', EDITOR_ACCESS: 'beestoon',
+            BEESTOON_API_URL: API, EDITOR_SERVICE_KEY: SERVICE_KEY, JWT_SECRET: SECRET },
+        encoding: 'utf8', timeout: 15000
+    });
+    check('the server refuses to start when the dev login comes back next to EDITOR_ACCESS=beestoon', () => {
+        assert.equal(reverted.status, 1);
+        assert.match(reverted.stderr, /Refusing to start[\s\S]*AUTH_PROVIDER=jwt/);
+    });
+
+
+    console.log('\nMatchmaking (direct POST /matchmake)');
+
+    const anonymous = await matchmake(null, 'probe-anon-0001');
+    const garbage = await matchmake('not-a-token', 'probe-anon-0002');
+    const cidDirect = await matchmake(token('cid'), 'probe-cid-00001');
+    const cidCreate = await matchmake(token('cid'), 'probe-cid-00002', 'create');
+    await sleep(300);
+    check('anonymous and invalid logins get 401 and no room is created', () => {
+        assert.equal(anonymous.status, 401);
+        assert.equal(garbage.status, 401);
+        assert.ok(!created('probe-anon-0001') && !created('probe-anon-0002'));
+    });
+    check('an account without editor access gets 403 from joinOrCreate and create, and no room is created', () => {
+        assert.equal(cidDirect.status, 403);
+        assert.equal(cidCreate.status, 403);
+        assert.ok(!created('probe-cid-00001') && !created('probe-cid-00002'));
+    });
+
+    const adaDirect = await matchmake(token('ada'), 'probe-ada-00001');
+    await waitFor(() => created('probe-ada-00001'), 'ada room');
+    const bobDirect = await matchmake(token('bob'), 'probe-bob-00001', 'create');
+    await waitFor(() => created('probe-bob-00001'), 'bob room');
+    check('both accounts with editor access get a seat in a new room (joinOrCreate and create)', () => {
+        assert.equal(adaDirect.status, 200);
+        assert.ok(adaDirect.json?.roomId);
+        assert.equal(bobDirect.status, 200);
+        assert.ok(bobDirect.json?.roomId);
+    });
+
+
     console.log('\nJoining');
 
     const ada = await connect('ada', 'create', { sessionType: 'basic', sessionName: 'Access' });
     check('an account with editor access creates a session', () => assert.equal(ada.state.you.status, 'approved'));
+    check('public AR share links are off in the session features', () => assert.equal(ada.state.features.arShare, false));
 
     const cidAlone = await refusal('cid');
     check('an account without editor access cannot join (403)', () => assert.equal(cidAlone?.code, 403));
@@ -219,6 +302,15 @@ async function main() {
 
     const before = await download(bobTicket, sceneId);
     check('session assets: Bob\'s ticket passes the download check (file lookup, not 401)', () => assert.notEqual(before, 401));
+
+    const arUpload = await fetch(`${SERVER}/ar/snapshots?name=x.glb`, {
+        method: 'POST', headers: { Authorization: `Bearer ${bobTicket}`, 'Content-Type': 'application/octet-stream' }, body: 'glb'
+    });
+    const arView = await fetch(`${SERVER}/ar/${'a'.repeat(30)}`);
+    check('AR share routes do not exist: upload with a member ticket and viewing both 404', () => {
+        assert.equal(arUpload.status, 404);
+        assert.equal(arView.status, 404);
+    });
 
     const mineBob = await mine('bob');
     const mineCid = await mine('cid');

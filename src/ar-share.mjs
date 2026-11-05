@@ -32,10 +32,17 @@
  *
  * Storage: see ar-storage.mjs (local folder or
  * S3 / DigitalOcean Spaces).
+ *
+ * AR_SHARING=on|off. The links are public and anonymous,
+ * so with EDITOR_ACCESS=beestoon the default is off: no
+ * /ar route exists (404) and session:state says
+ * features.arShare=false. Without EDITOR_ACCESS the
+ * default stays on (development).
  */
 
 import express from 'express';
 import { setCorsOrigin } from './cors.mjs';
+import { accessChecked } from './editor-access.mjs';
 
 import { randomBytes } from 'node:crypto';
 import { pipeline } from 'node:stream/promises';
@@ -61,7 +68,28 @@ const GLB_MAGIC = 0x46546C67;          // "glTF"
 const ID_PATTERN = /^[A-Za-z0-9_-]{30}$/;
 
 
+export function arSharingEnabled(env = process.env) {
+
+    const value = String(env.AR_SHARING || '').toLowerCase();
+
+    if (value === 'on' || value === 'off') {
+        return value === 'on';
+    }
+
+    return !accessChecked(env);
+}
+
+
 export function registerArShareRoutes(app) {
+
+    if (!arSharingEnabled()) {
+        console.log('AR share links: off (AR_SHARING)');
+        app.use('/ar', (req, res) => {
+            setCorsOrigin(req, res);
+            res.status(404).send('AR share links are switched off');
+        });
+        return;
+    }
 
     // Fails at start-up when the storage settings are wrong
     const storage = getArStorage();
