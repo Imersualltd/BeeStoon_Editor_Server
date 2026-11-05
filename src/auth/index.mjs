@@ -41,7 +41,11 @@ let selected = null;
  */
 export function productionProblems(env = process.env) {
 
-    if (env.NODE_ENV !== 'production') {
+    // The Docker image always sets NODE_ENV=production, also for
+    // the existing development service on Render (render.yaml,
+    // dev identity). That service must say so explicitly:
+    // EDITOR_DEPLOYMENT=development (logged loudly at start-up).
+    if (env.NODE_ENV !== 'production' || env.EDITOR_DEPLOYMENT === 'development') {
         return [];
     }
 

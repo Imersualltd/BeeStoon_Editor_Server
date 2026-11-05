@@ -30,6 +30,10 @@ const HOST = process.env.HOST || '0.0.0.0';
 // Unsafe production settings stop the server at start-up
 const problems = productionProblems();
 
+if (process.env.NODE_ENV === 'production' && process.env.EDITOR_DEPLOYMENT === 'development') {
+    console.warn('EDITOR_DEPLOYMENT=development: production safety checks are OFF (development service only)');
+}
+
 if (problems.length) {
     console.error(`Refusing to start in production:\n  - ${problems.join('\n  - ')}`);
     process.exit(1);

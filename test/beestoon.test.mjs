@@ -186,6 +186,11 @@ async function main() {
         }
     });
 
+    check('only an explicit development deployment skips the checks (the Render dev service)', () => {
+        assert.deepEqual(productionProblems({ NODE_ENV: 'production', EDITOR_DEPLOYMENT: 'development', AUTH_PROVIDER: 'dev' }), []);
+        assert.ok(productionProblems({ NODE_ENV: 'production', AUTH_PROVIDER: 'dev', ALLOW_DEV_AUTH: 'true' }).length > 0);
+    });
+
     check('the BeeStoon production settings pass', () => {
         assert.deepEqual(productionProblems({ NODE_ENV: 'production', AUTH_PROVIDER: 'jwt', JWT_SECRET: SECRET,
             JWT_ISSUER: 'beestoon-api', JWT_AUDIENCE: 'beestoon-editor', CORS_ORIGINS: SITE,
