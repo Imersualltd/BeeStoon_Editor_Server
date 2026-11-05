@@ -2803,6 +2803,9 @@ export class ModelRoom extends Room {
                 fileBytes: this.limits.fileBytes
             },
             usedBytes: this.usedBytes(),
+            // Where this session's files are (texture links for
+            // material edits); downloads still need a ticket
+            sceneId: this.sceneId,
             credits: creditsEnabled()
                 ? {
                     pool: {

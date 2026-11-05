@@ -143,7 +143,10 @@ async function main() {
     ada.send('join:approve', { userId: 'dev:cat', role: 'editor' });
     ada.send('join:approve', { userId: 'dev:vic', role: 'viewer' });
     await waitFor(() => bob.state.you.ticket && cat.state.you.ticket && vic.state.you.ticket, 'approved');
-    check('the server announces material sync', () => assert.equal(ada.state.features.materials, true));
+    check('the server announces material sync and the file location to members', () => {
+        assert.equal(ada.state.features.materials, true);
+        assert.match(vic.state.sceneId, /^[A-Za-z0-9_-]{20,64}$/);
+    });
 
     const glb = fakeGlb(4096, 7);
     const up = await post('/assets?name=chair.glb', bob.state.you.ticket, glb);
