@@ -28,6 +28,14 @@
  *      ticket at once. ASSET_DOWNLOAD_AUTH=open restores
  *      the old link-only access (development only).
  *
+ *      ?link=1 answers { url, expiresIn } instead of the
+ *      redirect, after checking the file is still stored
+ *      (404 { code: 'missing' } if not). The page then
+ *      fetches the signed link itself: a browser following
+ *      the redirect sends "Origin: null" to the bucket,
+ *      which a bucket CORS rule for the site refuses.
+ *      Without bucket storage the file comes as before.
+ *
  * Files are stored once per scene by content (sha256),
  * so the same model imported twice, or kept in many
  * saved versions later, is stored and counted once.
@@ -247,18 +255,14 @@ async function handleTextureDownload(req, res, storage, sceneId, textureId) {
 
     const key = textureKey(sceneId, textureId);
 
-    const signed = await storage.signedUrl(key, SIGNED_URL_SECONDS);
-
-    if (signed) {
-        res.setHeader('Cache-Control', 'no-store');
-        res.redirect(302, signed);
+    if (await sendSignedLink(req, res, storage, key)) {
         return;
     }
 
     const body = await storage.get(key);
 
     if (!body) {
-        res.status(404).send('Not found');
+        notStored(req, res);
         return;
     }
 
@@ -296,11 +300,7 @@ async function handleDownload(req, res, storage) {
     const key = blobKey(sceneId, assetId);
 
     // S3 / Spaces: let the bucket send it
-    const signed = await storage.signedUrl(key, SIGNED_URL_SECONDS);
-
-    if (signed) {
-        res.setHeader('Cache-Control', 'no-store');
-        res.redirect(302, signed);
+    if (await sendSignedLink(req, res, storage, key)) {
         return;
     }
 
@@ -308,7 +308,7 @@ async function handleDownload(req, res, storage) {
     const body = await storage.get(key);
 
     if (!body) {
-        res.status(404).send('Not found');
+        notStored(req, res);
         return;
     }
 
@@ -319,6 +319,49 @@ async function handleDownload(req, res, storage) {
     res.setHeader('Cache-Control', 'private, max-age=31536000, immutable');
 
     res.send(body);
+}
+
+
+// Bucket storage: the signed link (?link=1) or a redirect
+// to it. False without bucket storage (the caller sends
+// the file itself).
+async function sendSignedLink(req, res, storage, key) {
+
+    const signed = await storage.signedUrl(key, SIGNED_URL_SECONDS);
+
+    if (!signed) {
+        return false;
+    }
+
+    res.setHeader('Cache-Control', 'no-store');
+
+    if (req.query.link !== '1') {
+        res.redirect(302, signed);
+        return true;
+    }
+
+    if (!(await storage.exists(key))) {
+        notStored(req, res);
+        return true;
+    }
+
+    res.json({ url: signed, expiresIn: SIGNED_URL_SECONDS });
+
+    return true;
+}
+
+
+// The saved session names a file that is no longer stored
+function notStored(req, res) {
+
+    console.warn(`[assets] missing from storage: ${req.params.sceneId}/${req.params.file}`);
+
+    if (req.query.link === '1') {
+        res.status(404).json({ code: 'missing', message: 'This file is no longer in the session storage' });
+        return;
+    }
+
+    res.status(404).send('Not found');
 }
 
 

@@ -843,6 +843,8 @@ export class ModelRoom extends Room {
 
             user.ticket = user.ticket || issueTicket(this, userId);
 
+            this.sendMissingFiles(client);
+
         } else if (!wasOnline) {
 
             for (const admin of this.onlineUsers('admin')) {
@@ -2543,19 +2545,52 @@ export class ModelRoom extends Room {
     }
 
 
+    // A saved version named files that are gone (loadObjects)
+    sendMissingFiles(client) {
+
+        if (!this.missingFiles?.length) {
+            return;
+        }
+
+        const list = this.missingFiles.map((f) => `${f.name} (${f.reason})`).join(', ');
+
+        client.send('session:notice', {
+            kind: 'error',
+            missingFiles: this.missingFiles,
+            text: `${this.missingFiles.length} saved file(s) of this session could not be loaded: ${list}. The saved session itself is kept.`
+        });
+    }
+
+
     // Objects of a saved version -> this.objects (on
     // re-open). Returns the new map; nothing is sent.
     async loadObjects(manifest) {
 
         const objects = new Map();
 
+        // Files the saved version names that are no longer
+        // stored: their objects stay (a later save keeps
+        // them), and everyone who joins is told
+        const missing = [];
+
+        const storage = getSceneStorage();
+
         for (const o of manifest?.objects || []) {
 
             if (!isValidId(o.id) || !ASSET_ID_PATTERN.test(String(o.assetId))) {
+                console.warn(`[${this.roomId}] saved object without a stored file skipped: ${String(o?.name || o?.id).slice(0, 80)}`);
+                missing.push({ name: String(o?.name || 'model').slice(0, 80), reason: 'the saved record names no stored file' });
                 continue;
             }
 
-            const url = o.url || this.assetUrl(o.assetId);
+            if (!(await storage.exists(blobKey(this.sceneId, o.assetId)).catch(() => true))) {
+                console.warn(`[${this.roomId}] missing from storage: ${blobKey(this.sceneId, o.assetId)} (${String(o.name).slice(0, 80)})`);
+                missing.push({ name: String(o.name || 'model').slice(0, 80), reason: 'its file is no longer in the session storage' });
+            }
+
+            // This server's link (a version saved under another
+            // address, e.g. an earlier service, keeps working)
+            const url = this.assetUrl(o.assetId) || o.url;
 
             this.uploads.set(o.assetId, { size: o.size, url });
 
@@ -2592,6 +2627,7 @@ export class ModelRoom extends Room {
 
         this.objects = objects;
         this.totalBytes = 0;
+        this.missingFiles = missing;
 
         return objects;
     }
@@ -2660,6 +2696,14 @@ export class ModelRoom extends Room {
 
             } else {
                 this.sendApproved('object:add', next);
+            }
+        }
+
+        for (const user of this.users.values()) {
+            if (user.status === 'approved' && user.online) {
+                for (const client of user.clients) {
+                    this.sendMissingFiles(client);
+                }
             }
         }
 

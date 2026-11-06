@@ -1,6 +1,8 @@
 services:
   - type: web
-    name: be-water-multiplayer
+    # https://beestoon-editor.onrender.com, deployed from the
+    # deploy/beestoon-editor branch. Be Water runs separately.
+    name: beestoon-editor
     # Docker so the server image can include the assimp
     # tool needed for GLB -> FBX export (see Dockerfile).
     runtime: docker
@@ -38,8 +40,10 @@ services:
         value: https://beestoon.ai
       - key: INVITE_BASE_URL
         value: https://beestoon.ai/editor
+      # This service's own address: the links to session
+      # files it hands out (assets.mjs) start with it
       - key: PUBLIC_BASE_URL
-        value: https://be-water-multiplayer.onrender.com
+        value: https://beestoon-editor.onrender.com
       # Pilot: no editor charges (prices not confirmed),
       # no public anonymous AR links, invites only logged
       - key: CREDITS_PROVIDER
