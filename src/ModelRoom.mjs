@@ -93,7 +93,8 @@
  *                         alone only asks to join. Invites expire
  *                         after INVITE_TTL_HOURS (default 72), are
  *                         kept with a saved session, and a kicked
- *                         person stays out. With INVITE_BASE_URL
+ *                         person always waits for an admin again
+ *                         (Request to join). With INVITE_BASE_URL
  *                         set, the email always links there.)
  *     'invite:revoke'     { email }
  *     'join:approve'      { userId, role }
@@ -108,7 +109,7 @@
  *   server -> client
  *     'session:state'     see stateFor() - sent on every
  *                         change of people, roles or locks
- *     'join:request'      { userId, name }   (admins)
+ *     'join:request'      { userId, name, removedBefore }   (admins)
  *     'invite:result'     { sent: [email], failed: [{ email, reason }] }
  *     'session:notice'    { text }
  *     'session:idle-warning' { secondsLeft }
@@ -497,9 +498,9 @@ export class ModelRoom extends Room {
             throw new ServerError(401, `Login failed: ${error.message}`);
         }
 
-        if (this.banned.has(identity.userId)) {
-            throw new ServerError(403, 'You were removed from this session');
-        }
+        // Someone an admin removed may connect again, but only
+        // to ask: onJoin keeps them waiting until an admin lets
+        // them in (this.banned = removed, see user:kick)
 
         // The BeeStoon account must have editor access. An
         // invite or a role in this session never replaces it.
@@ -787,8 +788,17 @@ export class ModelRoom extends Room {
                 dropped: new Set()
             };
 
-            // The creator of the session is its first admin
-            if (!this.hasCreator) {
+            // Removed by an admin: always a new join request,
+            // never back in by an earlier role or an invite
+            if (this.banned.has(userId)) {
+
+                user.removedBefore = true;
+
+                console.log(`[${this.roomId}] "${name}" was removed earlier and asks to join again`);
+
+            } else if (!this.hasCreator) {
+
+                // The creator of the session is its first admin
 
                 this.hasCreator = true;
 
@@ -848,7 +858,7 @@ export class ModelRoom extends Room {
         } else if (!wasOnline) {
 
             for (const admin of this.onlineUsers('admin')) {
-                this.sendToUser(admin, 'join:request', { userId, name });
+                this.sendToUser(admin, 'join:request', { userId, name, removedBefore: !!user.removedBefore });
             }
         }
 
@@ -1447,6 +1457,12 @@ export class ModelRoom extends Room {
             user.role = data.role;
             user.ticket = issueTicket(this, user.userId);
 
+            // Let in again after a removal: no longer removed
+            if (this.banned.delete(user.userId)) {
+                user.removedBefore = false;
+                this.markDirty();
+            }
+
 
             console.log(`[${this.roomId}] ${admin.name} approved "${user.name}" as ${user.role}`);
 
@@ -1902,7 +1918,7 @@ export class ModelRoom extends Room {
 
             try {
 
-                await sendInvite({ to: email, from: admin.name, role, link });
+                await sendInvite({ to: email, from: admin.name, role, link, sessionKey: this.sessionKey });
 
                 // Again for the same address: the newest role and expiry
                 this.invites.set(email, {
@@ -2870,7 +2886,9 @@ export class ModelRoom extends Room {
                 online: u.online,
                 joinedAt: u.joinedAt,
                 // Browsers this person has open
-                devices: u.clients.size
+                devices: u.clients.size,
+                // Waiting again after an admin removed them
+                removedBefore: !!u.removedBefore
             });
         }
 

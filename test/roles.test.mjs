@@ -333,8 +333,32 @@ async function main() {
     await waitFor(() => carol.leftCode !== null, 'carol kicked');
     check('kicked user is disconnected with code 4101', () => assert.equal(carol.leftCode, 4101));
     assert.equal(await post('/export/fbx', carolTicket), 401);
-    await rejects(connect('Carol', KEY), 'kicked user rejoins');
-    check('kicked user cannot come back', () => {});
+    admin.clear();
+    const carolAgain = await connect('Carol', KEY);
+    check('removed user can connect again only to ask (pending, no models, no ticket)', () => {
+        assert.equal(carolAgain.state.you.status, 'pending');
+        assert.equal(carolAgain.state.you.role, null);
+        assert.ok(!carolAgain.state.you.ticket);
+        assert.ok(!carolAgain.got('object:add'));
+    });
+    await waitFor(() => admin.got('join:request', (p) => p.userId === 'dev:carol'), 'admin told carol asks again');
+    check('admin gets the request, marked as removed before', () => {
+        assert.equal(admin.messages.find((m) => m.type === 'join:request' && m.payload.userId === 'dev:carol').payload.removedBefore, true);
+        assert.equal(userIn(admin, 'Carol')?.removedBefore, true);
+    });
+    admin.send('join:deny', { userId: 'dev:carol' });
+    await waitFor(() => carolAgain.leftCode !== null, 'carol denied again');
+    const carolThird = await connect('Carol', KEY);
+    check('after a deny the removed user can still ask again', () => assert.equal(carolThird.state.you.status, 'pending'));
+    admin.send('join:approve', { userId: 'dev:carol', role: 'viewer' });
+    await waitFor(() => carolThird.state.you.status === 'approved', 'carol let in again');
+    check('only after Let in / Approve is the removed user back, with the chosen role', () => {
+        assert.equal(carolThird.state.you.role, 'viewer');
+        assert.ok(carolThird.state.you.ticket);
+        assert.equal(userIn(admin, 'Carol')?.removedBefore, false);
+    });
+    admin.send('user:kick', { userId: 'dev:carol' });
+    await waitFor(() => carolThird.leftCode !== null, 'carol removed once more');
 
     admin.send('join:deny', { userId: 'dev:dave' });
     await waitFor(() => dave.leftCode !== null, 'dave denied');
