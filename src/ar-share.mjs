@@ -38,6 +38,19 @@
  * /ar route exists (404) and session:state says
  * features.arShare=false. Without EDITOR_ACCESS the
  * default stays on (development).
+ *
+ * What a link exposes, on purpose: the one GLB the member
+ * chose (selected models or the visible scene, textures
+ * inside) and its file name. Nothing else: no session key,
+ * scene id, member names or session file links. The
+ * session and the member who made it are kept in
+ * meta.json on the server only. Ids are 176 random bits,
+ * never listed; pages are noindex / no-referrer.
+ *
+ * With EDITOR_ACCESS=beestoon a link lasts 2 h unless
+ * AR_LINK_HOURS says otherwise, a session makes at most
+ * AR_LINKS_PER_HOUR links (default 30), and an admin
+ * closing the session deletes its links at once.
  */
 
 import express from 'express';
@@ -54,7 +67,15 @@ import { requireMember } from './sessions.mjs';
 // Keep in sync with MAX_AR_SNAPSHOT_SIZE in the editor's ar-share.mjs
 const MAX_UPLOAD_BYTES = 50 * 1024 * 1024;
 
-const LINK_HOURS = Number(process.env.AR_LINK_HOURS) || 24;
+const LINK_HOURS = Number(process.env.AR_LINK_HOURS) || (accessChecked() ? 2 : 24);
+
+const LINKS_PER_HOUR = Number(process.env.AR_LINKS_PER_HOUR) || 30;
+
+// sessionKey -> when its links were made (last hour)
+const recentLinks = new Map();
+
+// Set once the routes exist (revokeSessionLinks uses it)
+let liveStorage = null;
 
 const SWEEP_MS = 30 * 60 * 1000;
 
@@ -93,6 +114,8 @@ export function registerArShareRoutes(app) {
 
     // Fails at start-up when the storage settings are wrong
     const storage = getArStorage();
+
+    liveStorage = storage;
 
 
     // The editor runs on another origin, and phones fetch
@@ -170,21 +193,41 @@ async function handleUpload(req, res, storage) {
     }
 
 
-    const id = randomBytes(22).toString('base64url');
+    const sessionKey = req.member?.sessionKey || null;
     const now = Date.now();
+
+    if (sessionKey) {
+
+        const times = (recentLinks.get(sessionKey) || []).filter((t) => t > now - 3600 * 1000);
+
+        if (times.length >= LINKS_PER_HOUR) {
+            res.status(429).send('Too many AR links for this session in the last hour - try again later');
+            return;
+        }
+
+        times.push(now);
+        recentLinks.set(sessionKey, times);
+    }
+
+
+    const id = randomBytes(22).toString('base64url');
 
     const meta = {
         id,
         name: safeName(req.query.name),
         size: body.length,
         createdAt: new Date(now).toISOString(),
-        expiresAt: new Date(now + LINK_HOURS * 3600 * 1000).toISOString()
+        expiresAt: new Date(now + LINK_HOURS * 3600 * 1000).toISOString(),
+        // Server only (never on the page): whose links to
+        // delete when the session is closed
+        sessionKey,
+        createdBy: req.member?.userId || null
     };
 
     await storage.put(id, body, meta);
 
 
-    console.log(`[ar] snapshot ${id.slice(0, 6)}... ${meta.name} (${(body.length / 1048576).toFixed(1)} MB)`);
+    console.log(`[ar] snapshot ${id.slice(0, 6)}... session ${shortKey(sessionKey)} by ${shortKey(meta.createdBy)} (${(body.length / 1048576).toFixed(1)} MB, ${LINK_HOURS} h)`);
 
     res.json({
         id,
@@ -194,9 +237,20 @@ async function handleUpload(req, res, storage) {
 }
 
 
+// Capability links: not indexed, not passed on as a referrer
+function privateHeaders(res) {
+
+    res.setHeader('X-Robots-Tag', 'noindex, nofollow');
+    res.setHeader('Referrer-Policy', 'no-referrer');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+}
+
+
 async function handleViewer(req, res, storage) {
 
     const meta = await liveMeta(req.params.id, storage);
+
+    privateHeaders(res);
 
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
     res.setHeader('Cache-Control', 'no-store');
@@ -214,6 +268,8 @@ async function handleModel(req, res, storage) {
 
     const meta = await liveMeta(req.params.id, storage);
 
+    privateHeaders(res);
+
     if (!meta) {
         res.status(410).send('This AR link has expired');
         return;
@@ -223,7 +279,11 @@ async function handleModel(req, res, storage) {
 
     res.setHeader('Content-Type', 'model/gltf-binary');
     res.setHeader('Content-Length', String(meta.size));
-    res.setHeader('Cache-Control', 'private, max-age=3600');
+
+    // Not cached past the link's end
+    const left = Math.max(0, Math.floor((Date.parse(meta.expiresAt) - Date.now()) / 1000));
+
+    res.setHeader('Cache-Control', `private, max-age=${Math.min(3600, left)}`);
 
     await pipeline(stream, res);
 }
@@ -255,6 +315,48 @@ async function liveMeta(id, storage) {
     }
 
     return meta;
+}
+
+
+/*
+ * A session closed by its admin: its AR links stop at
+ * once instead of living until they expire.
+ */
+export async function revokeSessionLinks(sessionKey) {
+
+    recentLinks.delete(sessionKey);
+
+    if (!liveStorage || !sessionKey) {
+        return 0;
+    }
+
+    let removed = 0;
+
+    try {
+        for (const id of await liveStorage.listIds()) {
+
+            const meta = await liveStorage.getMeta(id);
+
+            if (meta?.sessionKey === sessionKey) {
+                await liveStorage.remove(id);
+                removed++;
+            }
+        }
+    } catch (error) {
+        console.warn('[ar] could not delete the closed session\'s links:', error.message);
+    }
+
+    if (removed) {
+        console.log(`[ar] ${removed} link(s) of session ${shortKey(sessionKey)} deleted (session closed)`);
+    }
+
+    return removed;
+}
+
+
+function shortKey(value) {
+
+    return value ? `${String(value).slice(0, 6)}...` : '-';
 }
 
 

@@ -162,6 +162,18 @@ async function beestoon(method, path, body) {
         const error = new Error('not enough credits');
         error.userMessage = data?.detail?.error || 'Not enough BeeStoon credits.';
         error.balance = data?.detail?.balance;
+        error.code = data?.detail?.code || 'insufficient_credits';
+        throw error;
+    }
+
+    // A refusal with a reason for the person (a pool withdrawal larger
+    // than what may be taken back, a reused request key ...)
+    if ((response.status === 409 || response.status === 422) && data?.detail?.error) {
+        const error = new Error(data.detail.error);
+        error.userMessage = data.detail.error;
+        error.code = data.detail.code || null;
+        error.withdrawable = data.detail.withdrawable;
+        error.status = response.status;
         throw error;
     }
 
@@ -314,6 +326,62 @@ export function poolFromOptions(options) {
         forEntry: options?.poolForEntry === true,
         forModels: options?.poolForModels === true
     };
+}
+
+
+// ==================================================
+// SESSION CREDIT POOL (kept by BeeStoon)
+// ==================================================
+
+/*
+ * EDITOR_POOL=on (with CREDITS_PROVIDER=beestoon): the session
+ * credit pool lives in BeeStoon's database (beestoon-backend
+ * app/api/editor_pool.py), not in this server's memory. Admins
+ * add and withdraw through the room (credits:add,
+ * credits:withdraw); BeeStoon moves the credits between the
+ * admin's balance and the pool in one transaction, once per
+ * request key, and keeps the history. It survives refreshes,
+ * restarts of this server and reopening a saved session.
+ * Independent of CREDITS_ENABLED: the pool can be on while
+ * session and entry prices are still off.
+ */
+export function beestoonPoolEnabled() {
+
+    return creditsProvider() === 'beestoon' && String(process.env.EDITOR_POOL || '').toLowerCase() === 'on';
+}
+
+
+const poolPath = (sessionKey, action = '') =>
+    `/internal/editor/pools/${encodeURIComponent(sessionKey)}${action ? `/${action}` : ''}`;
+
+export const beestoonPool = {
+    read: (sessionKey, userId) =>
+        beestoon('GET', poolPath(sessionKey) + (userId ? `?userId=${encodeURIComponent(userId)}` : '')),
+    deposit: (sessionKey, userId, amount, key) =>
+        beestoon('POST', poolPath(sessionKey, 'deposit'), { userId, amount, key }),
+    withdraw: (sessionKey, userId, amount, key) =>
+        beestoon('POST', poolPath(sessionKey, 'withdraw'), { userId, amount, key }),
+    settings: (sessionKey, settings) =>
+        beestoon('POST', poolPath(sessionKey, 'settings'), settings),
+    // One piece of work, paid once by the pool or the person
+    charge: (sessionKey, { userId, amount, key, purpose, reason }) =>
+        beestoon('POST', poolPath(sessionKey, 'charge'), { userId, amount, key, purpose, reason: String(reason || '').slice(0, 200) })
+};
+
+
+// A person's BeeStoon balance for display (the pool panel), also
+// while session prices are off; null when unknown
+export async function personalBalance(userId) {
+
+    if (creditsProvider() !== 'beestoon') {
+        return balanceOf(userId);
+    }
+
+    try {
+        return (await beestoon('GET', `/internal/editor/credits/${encodeURIComponent(userId)}`)).balance;
+    } catch {
+        return null;
+    }
 }
 
 

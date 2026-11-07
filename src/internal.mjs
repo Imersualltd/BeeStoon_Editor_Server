@@ -41,6 +41,7 @@ import express from 'express';
 
 import { sceneOfKey } from './scene-versions.mjs';
 import { liveRoomOf, SESSION_KEY_PATTERN } from './sessions.mjs';
+import { readRecord } from './session-records.mjs';
 import { USER_ID_PATTERN } from './auth/util.mjs';
 
 
@@ -69,15 +70,35 @@ export async function membershipOf(sessionKey, userId) {
             return { member: true, role: user.role, owner: room.owner?.userId === userId, live: true };
         }
 
-        // Not (yet) let in: the saved attendee list does not
-        // count while the room is open, the room decides
+        // Approved earlier and not connected right now (a refresh,
+        // the moment after a server restart): still a member
+        const known = !user && room.known?.get(userId);
+
+        if (known) {
+            return { member: true, role: known.role, owner: room.owner?.userId === userId, live: true };
+        }
+
+        // Waiting for approval: the room decides
         return null;
     }
 
     const scene = await sceneOfKey(sessionKey);
 
     if (!scene) {
-        return null;
+        // Never saved: its record (session-records.mjs) says who belongs
+        const record = await readRecord(sessionKey);
+
+        if (!record || record.closedByAdmin || (record.removed || []).includes(userId)) {
+            return null;
+        }
+
+        if (record.owner?.userId === userId) {
+            return { member: true, role: 'admin', owner: true, live: false };
+        }
+
+        const recorded = record.members?.[userId]?.role;
+
+        return recorded ? { member: true, role: recorded, owner: false, live: false } : null;
     }
 
     if (scene.owner?.userId === userId) {
