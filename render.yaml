@@ -45,7 +45,9 @@ services:
       - key: PUBLIC_BASE_URL
         value: https://beestoon-editor.onrender.com
       # Pilot: no editor charges (prices not confirmed),
-      # no public anonymous AR links, invites only logged
+      # no public anonymous AR links (AR runs on the
+      # member's own device). Invites go out through
+      # BeeStoon's Postmark (the API's SMTP settings)
       - key: CREDITS_PROVIDER
         value: beestoon
       - key: CREDITS_ENABLED
@@ -54,7 +56,7 @@ services:
       - key: AR_SHARING
         value: "off"
       - key: MAIL_PROVIDER
-        value: log
+        value: beestoon
       # Saved sessions and model files: Spaces
       - key: SCENE_STORAGE
         value: s3

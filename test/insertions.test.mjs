@@ -140,7 +140,9 @@ const env = {
     PORT: String(PORT),
     AUTH_PROVIDER: 'jwt', JWT_SECRET: SECRET, JWT_ISSUER: 'beestoon-api', JWT_AUDIENCE: 'beestoon-editor',
     CORS_ORIGINS: SITE, CREDITS_ENABLED: 'false', EDITOR_ACCESS: 'beestoon',
-    BEESTOON_API_URL: API, EDITOR_SERVICE_KEY: SERVICE_KEY, MAIL_PROVIDER: 'log',
+    BEESTOON_API_URL: API, EDITOR_SERVICE_KEY: SERVICE_KEY,
+    // BeeStoon mode never "sends" by logging: a test inbox
+    MAIL_PROVIDER: 'capture', MAIL_CAPTURE_DIR: path.join(storageDir, 'mail'),
     INVITE_BASE_URL: `${SITE}/editor`, PUBLIC_BASE_URL: SERVER,
     SCENE_STORAGE: 'local', SCENE_LOCAL_DIR: path.join(storageDir, 'scenes'), AUTOSAVE_MINUTES: '0'
 };
