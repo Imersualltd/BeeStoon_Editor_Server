@@ -3650,6 +3650,8 @@ export class ModelRoom extends Room {
                 credits: (creditsEnabled() && paidFeatureEnabled('pool')) || !!this.poolBacked,
                 // credits:withdraw (admins; the pool kept by BeeStoon)
                 poolWithdraw: !!this.poolBacked,
+                // A non-admin's Save is a request an admin approves (save:request)
+                saveApproval: true,
                 // session:upgrade (admins)
                 sessionUpgrade: paidFeatureEnabled('upgrade'),
                 // object:material (material/texture sync)

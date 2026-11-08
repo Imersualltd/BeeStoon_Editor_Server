@@ -113,6 +113,9 @@ async function main() {
         assert.equal(ada.all('save:request').length, 1);
         assert.equal(cy.all('save:request').length, 1);
     });
+    check('the server says so (features.saveApproval), so the editor words Save as a request', () => {
+        assert.equal(ben.state.features.saveApproval, true);
+    });
     check('the requester sees pending (the same request for every click), nothing saved yet', () => {
         assert.ok(ben.all('save:status').every((s) => s.status === 'pending' && s.requestId === request.requestId));
         assert.equal(saves(), 0);
