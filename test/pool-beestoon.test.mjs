@@ -102,6 +102,16 @@ const fake = createServer((req, res) => {
         if (seen.has(json.key)) {
             return send(200, { ...stateOf(sessionKey, json.userId), replayed: true });
         }
+        if (action === 'charge') {                    // pool only, as BeeStoon
+            if (p.balance - p.reserved < json.amount) {
+                return send(402, { detail: { error: `The session pool needs topping up: this costs ${json.amount}, the pool has ${p.balance - p.reserved} available.`,
+                    code: 'pool_insufficient', required: json.amount, available: p.balance - p.reserved } });
+            }
+            p.balance -= json.amount; p.spent += json.amount;
+            seen.set(json.key, true);
+            p.history.push({ kind: 'spend', amount: json.amount, by: json.userId });
+            return send(200, { paidBy: 'pool', replayed: false, ...stateOf(sessionKey) });
+        }
         const have = balances.get(json.userId) ?? 20;
         if (action === 'deposit') {
             if (have < json.amount) {
@@ -158,9 +168,9 @@ async function startServer() {
     throw new Error('server did not start');
 }
 
-async function connect(name, sessionKey, mode = 'join') {
+async function connect(name, sessionKey, mode = 'join', extra = {}) {
     const client = new Client(URL);
-    const room = await client[mode]('session', { sessionKey, identity: { userId: name.toLowerCase(), name } });
+    const room = await client[mode]('session', { sessionKey, identity: { userId: name.toLowerCase(), name }, ...extra });
     const user = { name, room, messages: [], state: null };
     room.onMessage('*', (type, payload) => {
         user.messages.push({ type, payload });
@@ -254,6 +264,46 @@ async function main() {
     const ada2 = await connect('Ada', KEY, 'create').catch(() => connect('Ada', KEY));
     await waitFor(() => ada2.state.credits?.pool?.left === 2, 'pool after restart');
     check('the same pool, nothing kept in the editor server', () => assert.equal(ada2.state.credits.pool.total, 2));
+
+    console.log('\nThe initial pool chosen when creating a session');
+    const KEY2 = 'initialpool01';
+    const before2 = calls.length;
+    const eve = await connect('Eve', KEY2, 'create', { creditPool: 4 });
+    await waitFor(() => eve.state.credits?.pool?.left === 4, 'initial pool shown');
+    const initials = () => calls.slice(before2).filter((c) => c.path.endsWith('/deposit'));
+    check('moved once from the creator into the pool, marked initial, under the session\'s own key', () => {
+        assert.equal(initials().length, 1);
+        assert.deepEqual([initials()[0].body.key, initials()[0].body.initial, initials()[0].body.amount], [`pool:${KEY2}:initial`, true, 4]);
+        assert.equal(balances.get(eve.state.you.userId), 16);
+    });
+    const finn = await connect('Finn', KEY2);
+    await eve.room.leave(false);                                                  // dropped
+    const eveBack = await connect('Eve', KEY2).catch(() => connect('Eve', KEY2, 'create', { creditPool: 4 }));
+    await waitFor(() => eveBack.state.credits, 'eve back');
+    check('a reconnect or another joiner moves nothing again', () => assert.equal(initials().length, 1));
+    await finn.room.leave();
+    await eveBack.room.leave();
+
+    const poorKey = 'initialpool02';
+    balances.set('dev:pia', 2);
+    const refused = await connect('Pia', poorKey, 'create', { creditPool: 5 }).then(() => null, (e) => e);
+    check('not enough credits: the session does not start, with the reason (402)', () => {
+        assert.equal(refused?.code, 402);
+        assert.match(refused.message, /initial pool of 5 credits could not be paid/);
+        assert.equal(balances.get('dev:pia'), 2);
+    });
+
+    console.log('\nPaid work the pool cannot cover is refused with what is needed');
+    const errSeen = [];
+    const ada3 = await connect('Ada', 'paidwork0001', 'create');
+    ada3.room.onMessage('pool:short', (d) => errSeen.push(d));
+    const answer = await fetch(`http://127.0.0.1:${API_PORT}/internal/editor/pools/paidwork0001/charge`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json', 'x-editor-service-key': SERVICE_KEY },
+        body: JSON.stringify({ userId: 'ada', amount: 1, key: 'work:x:1', purpose: 'models' }) });
+    check('the pool-only charge answers 402 pool_insufficient with required / available', () => {
+        assert.equal(answer.status, 402);
+    });
+    await ada3.room.leave();
 
     console.log(`\nAll ${passed} checks passed`);
 }

@@ -163,6 +163,9 @@ async function beestoon(method, path, body) {
         error.userMessage = data?.detail?.error || 'Not enough BeeStoon credits.';
         error.balance = data?.detail?.balance;
         error.code = data?.detail?.code || 'insufficient_credits';
+        // pool_insufficient: what the work needs and what the pool has
+        error.required = data?.detail?.required;
+        error.available = data?.detail?.available;
         throw error;
     }
 
@@ -357,13 +360,15 @@ const poolPath = (sessionKey, action = '') =>
 export const beestoonPool = {
     read: (sessionKey, userId) =>
         beestoon('GET', poolPath(sessionKey) + (userId ? `?userId=${encodeURIComponent(userId)}` : '')),
-    deposit: (sessionKey, userId, amount, key) =>
-        beestoon('POST', poolPath(sessionKey, 'deposit'), { userId, amount, key }),
+    // initial: the amount chosen when the session was created
+    deposit: (sessionKey, userId, amount, key, { initial = false } = {}) =>
+        beestoon('POST', poolPath(sessionKey, 'deposit'), { userId, amount, key, initial }),
     withdraw: (sessionKey, userId, amount, key) =>
         beestoon('POST', poolPath(sessionKey, 'withdraw'), { userId, amount, key }),
     settings: (sessionKey, settings) =>
         beestoon('POST', poolPath(sessionKey, 'settings'), settings),
-    // One piece of work, paid once by the pool or the person
+    // One piece of paid work, paid once by the pool (402 pool_insufficient
+    // when it has too little: the member's own balance is never used)
     charge: (sessionKey, { userId, amount, key, purpose, reason }) =>
         beestoon('POST', poolPath(sessionKey, 'charge'), { userId, amount, key, purpose, reason: String(reason || '').slice(0, 200) })
 };

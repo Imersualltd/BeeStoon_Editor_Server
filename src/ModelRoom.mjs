@@ -399,6 +399,12 @@ export class ModelRoom extends Room {
             this.refreshPool();
         }
 
+        // The initial pool chosen on the start screen: moved from the
+        // creator's balance into BeeStoon's pool when they are let in
+        // (admit), once (key "initial"), only for a session that is new
+        this.initialPool = this.poolBacked && !saved && !record ? poolFromOptions(options).total : 0;
+        this.initialPaid = false;
+
         // A session that existed before (saved, or recorded
         // before a server restart) was paid for when it started
         this.creatorCharged = !!saved || !!record;
@@ -695,7 +701,65 @@ export class ModelRoom extends Room {
 
         await this.chargeOnJoin(identity);
 
+        await this.payInitialPool(identity);
+
         return identity;
+    }
+
+
+    /*
+     * The creator of a new session chose an initial pool: it moves
+     * from their BeeStoon balance into the session pool before they
+     * are let in, exactly once (BeeStoon key pool:<session>:initial:
+     * a retried join, a reconnect or a second browser moves nothing
+     * again). Not enough credits: the session does not start (402,
+     * with the reason); BeeStoon unreachable: 503, the editor tries
+     * again. A separate deposit, recorded as the initial
+     * contribution, never mixed with a session-creation charge.
+     */
+    async payInitialPool(identity) {
+
+        if (!this.initialPool || this.initialPaid || this.hasCreator || this.owner) {
+            return;
+        }
+
+        try {
+            const answer = await beestoonPool.deposit(this.sessionKey, identity.userId, this.initialPool,
+                `pool:${this.sessionKey}:initial`, { initial: true });
+            this.initialPaid = true;
+            this.applyPool(answer);
+            identity.balance = answer.personalBalance ?? identity.balance;
+            console.log(`[${this.roomId}] initial pool of ${this.initialPool} credit(s) from ${shortId(identity.userId)}` +
+                (answer.replayed ? ' (already moved: nothing moved again)' : ''));
+        } catch (error) {
+            console.log(`[${this.roomId}] initial pool of ${this.initialPool} refused for ${shortId(identity.userId)}: ` +
+                `${error.code || ''} ${error.message}`);
+            if (error.code === 'insufficient_credits') {
+                throw new ServerError(402, `The session was not started: its initial pool of ${this.initialPool} ` +
+                    `credit${this.initialPool === 1 ? '' : 's'} could not be paid. ${error.userMessage || ''}`.trim());
+            }
+            throw new ServerError(503, 'The initial session pool could not be set up. Trying again…');
+        }
+    }
+
+
+    /*
+     * Paid work the pool cannot cover: the person who asked sees
+     * why (required / available when known) and what to do; an
+     * admin gets the Top up action, others are told to ask one.
+     */
+    poolShort(client, user, action, error) {
+
+        const isAdmin = user?.role === 'admin';
+
+        client.send('pool:short', {
+            action,
+            required: error?.required ?? null,
+            available: error?.available ?? null,
+            isAdmin,
+            text: (error?.userMessage || 'The session pool needs topping up.') +
+                (isAdmin ? '' : ' Ask a session admin to add credits to the pool.')
+        });
     }
 
 
@@ -1786,10 +1850,15 @@ export class ModelRoom extends Room {
                 try {
                     await this.payEntry(user);
                 } catch (error) {
+                    if (error.code === 'pool_insufficient') {
+                        this.poolShort(client, admin, 'join:approve', error);
+                        return this.actionDenied(client, 'join:approve',
+                            `${user.name}'s entry is paid by the session pool, which needs topping up`);
+                    }
                     return this.actionDenied(
                         client,
                         'join:approve',
-                        `${user.name} has no credits left to enter, and the credit pool does not cover entries`
+                        error.userMessage || `${user.name} has no credits left to enter, and the credit pool does not cover entries`
                     );
                 }
 
@@ -1886,8 +1955,25 @@ export class ModelRoom extends Room {
                 return this.actionDenied(client, 'session:upgrade', 'Not a valid credit pool amount');
             }
 
-            if (creditsEnabled()) {
-
+            if (creditsEnabled() && this.poolBacked) {
+                // The session pool pays the upgrade (once per step: the key
+                // names it); more pool credits are the admin's deposit
+                try {
+                    if (pool) {
+                        this.applyPool(await beestoonPool.deposit(this.sessionKey, admin.userId, pool,
+                            `pool:${this.sessionKey}:upgrade-${from}-${to}`));
+                    }
+                    this.applyPool(await beestoonPool.charge(this.sessionKey, {
+                        userId: admin.userId, amount: cost, key: this.chargeKey(`upgrade:${from}-${to}`),
+                        purpose: 'upgrade', reason: `Upgraded "${this.sessionName}" to ${SESSION_TYPES[to].label}`
+                    }));
+                } catch (error) {
+                    if (error.code === 'pool_insufficient') {
+                        this.poolShort(client, admin, 'session:upgrade', error);
+                    }
+                    return this.actionDenied(client, 'session:upgrade', error.userMessage || 'Could not take the credits');
+                }
+            } else if (creditsEnabled()) {
                 try {
                     admin.balance = await charge(
                         admin.userId,
@@ -1979,6 +2065,9 @@ export class ModelRoom extends Room {
                 this.sendState();
             } catch (error) {
                 user.generationCharges.delete(requestId);
+                if (error.code === 'pool_insufficient') {
+                    this.poolShort(client, user, 'generation:charge', error);
+                }
                 client.send('generation:denied', { requestId, reason: error.userMessage || 'Not enough credits' });
             }
         });
