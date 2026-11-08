@@ -427,11 +427,17 @@ export function registerCreditRoutes(app) {
 
             res.setHeader('Cache-Control', 'no-store');
 
+            const pool = beestoonPoolEnabled();
+
             res.json({
                 enabled: creditsEnabled(),
-                balance: await balanceOf(me.userId),
+                // With the BeeStoon pool the balance is shown even while
+                // session prices are off: the start screen's initial pool
+                // is taken from it
+                balance: pool ? await personalBalance(me.userId) : await balanceOf(me.userId),
                 sessionCosts: SESSION_COSTS,
-                entryCost: ENTRY_COST
+                entryCost: ENTRY_COST,
+                pool
             });
 
         } catch (error) {
