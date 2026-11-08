@@ -55,7 +55,7 @@ services:
       # CREDITS_ENABLED (session and entry prices can stay off). Turn on
       # after the backend with the editor_pool migration is deployed.
       - key: EDITOR_POOL
-        value: "off"
+        value: "on"
       - key: CREDITS_ENABLED
         value: "false"
       # EDITOR_PAID_FEATURES unset: every paid editor feature is off
@@ -66,7 +66,7 @@ services:
       # the session (ar-share.mjs). Off: AR on the member's own
       # phone or tablet only.
       - key: AR_SHARING
-        value: "off"
+        value: "on"
       - key: MAIL_PROVIDER
         value: beestoon
       # Saved sessions and model files: Spaces
