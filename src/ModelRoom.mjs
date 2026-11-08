@@ -75,7 +75,11 @@
  *   same state and models. Leave in one browser only
  *   closes that browser (unless it closes the session).
  *
- *     'scene:save'        { name, description? }  (admins + editors)
+ *     'scene:save'        { name, description? }  (admins save; an editor's
+ *                         save is a request: save:status to them,
+ *                         save:request to admins)
+ *     'save:approve'      { requestId }  (admins; the first answer counts)
+ *     'save:decline'      { requestId }  (admins)
  *     'scene:versions'    {}  -> 'scene:versions' { versions }
  *
  *   Saved sessions (scene-versions.mjs): the first save
@@ -247,6 +251,12 @@ const IDLE_WARNING_MINUTES = Math.min(
 
 // Seconds between two saves by hand in one session
 const SAVE_COOLDOWN_SECONDS = 3;
+
+// A save asked for by a non-admin waits this long for an admin
+const SAVE_REQUEST_MINUTES = 10;
+
+const EMPTY_SAVE_REASON =
+    'Nothing to save yet: add a model first. An empty session is not kept as a saved session.';
 
 // Client-made ids (crypto.randomUUID or similar)
 const ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
@@ -1244,6 +1254,10 @@ export class ModelRoom extends Room {
 
             this.sendMissingFiles(client);
 
+            if (user.role === 'admin') {
+                this.sendSaveRequests(user);
+            }
+
         } else if (!wasOnline) {
 
             for (const admin of this.onlineUsers('admin')) {
@@ -1370,10 +1384,10 @@ export class ModelRoom extends Room {
         // which shut the owner out for 24 hours after any absence
         // longer than the reconnection window).
         if (user.role === 'admin' && user.status === 'approved' && this.onlineUsers('admin').length === 0) {
-
             if (!this.handOverAdmin(user)) {
                 console.log(`[${this.roomId}] last admin "${user.name}" left; the session stays open for its members`);
             }
+            this.checkSaveApprovers();
         }
 
 
@@ -2879,6 +2893,16 @@ export class ModelRoom extends Room {
                 return this.actionDenied(client, 'scene:save', 'Give the version a name');
             }
 
+            // A deliberate rule, said as such (it used to answer "Saving failed")
+            if (!this.scene && this.objects.size === 0) {
+                return this.actionDenied(client, 'scene:save', EMPTY_SAVE_REASON);
+            }
+
+            // Not an admin: the save waits for an admin's approval
+            if (user.role !== 'admin') {
+                return this.requestSave(client, user, name, cleanText(data?.description, MAX_VERSION_DESCRIPTION));
+            }
+
             if (Date.now() - this.lastManualSave < SAVE_COOLDOWN_SECONDS * 1000) {
                 return this.actionDenied(client, 'scene:save', 'Saved a moment ago - try again in a few seconds');
             }
@@ -2896,6 +2920,10 @@ export class ModelRoom extends Room {
             }
         });
 
+
+        // A non-admin's save: an admin approves or declines it (once)
+        this.onAdmin('save:approve', (client, admin, data) => this.answerSave(client, admin, data?.requestId, true));
+        this.onAdmin('save:decline', (client, admin, data) => this.answerSave(client, admin, data?.requestId, false));
 
         // Version list: everyone who is in
         this.onApproved('scene:versions', (client) => {
@@ -2943,15 +2971,18 @@ export class ModelRoom extends Room {
      * for autosaves. Returns the version summary, or null
      * (reason in this.saveError).
      */
-    async save(version, byUser) {
+    async save(version, byUser, approved = null) {
 
         // Nothing to keep in a session that never had a model
-        if (!this.scene && this.objects.size === 0) {
+        // (scene:save says so before getting here: EMPTY_SAVE_REASON)
+        if (!this.scene && (approved ? approved.objects.length : this.objects.size) === 0) {
             this.dirty = false;
             return null;
         }
 
-        const changesAtStart = this.changeCount;
+        // An approved request saves the scene as it was when asked
+        // (approved.objects); later changes stay unsaved
+        const changesAtStart = approved ? approved.revision : this.changeCount;
 
         // Insertions whose object is in this save: confirmed after it
         const toConfirm = [...this.unconfirmed].filter(([, objectId]) => this.objects.has(objectId));
@@ -2982,7 +3013,7 @@ export class ModelRoom extends Room {
                     removed: [...this.banned],
                     baseUrl: this.baseUrl
                 },
-                [...this.objects.values()],
+                approved ? approved.objects : [...this.objects.values()],
                 {
                     ...version,
                     savedBy: byUser
@@ -3039,6 +3070,161 @@ export class ModelRoom extends Room {
 
             if (!this.closed) {
                 this.sendState();
+            }
+        }
+    }
+
+
+    /*
+     * Save Session by a non-admin: a request for one admin's yes.
+     * It names the scene as it is now (a copy of every object), and
+     * that copy is what gets saved: changes made while waiting are
+     * not approved with it. One open request per person (pressing
+     * Save again answers with the same one). Nobody can approve: said
+     * at once, nothing saved. Answers to the requester: save:status
+     * { requestId, status: pending | approved | declined | expired |
+     * no-admin | failed, text }. Admins: save:request, then
+     * save:resolved for everyone's popup.
+     */
+    requestSave(client, user, name, description) {
+
+        this.saveRequests = this.saveRequests || new Map();
+
+        const open = [...this.saveRequests.values()]
+            .find((r) => r.by.userId === user.userId && r.status === 'pending');
+
+        if (open) {
+            return client.send('save:status', { requestId: open.id, status: 'pending', text: 'Waiting for a session admin to approve your save' });
+        }
+
+        const admins = this.onlineUsers('admin');
+
+        if (!admins.length) {
+            console.log(`[${this.roomId}] save asked by ${user.name}: no admin online, not saved`);
+            return client.send('save:status', {
+                requestId: null,
+                status: 'no-admin',
+                text: 'No session admin is online to approve this save, so nothing was saved. Ask an admin to join, or try again later.'
+            });
+        }
+
+        const request = {
+            id: randomUUID(),
+            by: { userId: user.userId, name: user.name },
+            name,
+            description,
+            revision: this.changeCount,
+            objects: [...this.objects.values()].map((o) => structuredClone(o)),
+            createdAt: Date.now(),
+            status: 'pending'
+        };
+
+        request.timer = setTimeout(() => this.resolveSave(request, 'expired', null,
+            'No admin answered in time; nothing was saved. You can ask again.'), SAVE_REQUEST_MINUTES * 60000);
+
+        this.saveRequests.set(request.id, request);
+
+        console.log(`[${this.roomId}] ${user.name} asks to save "${name}" (request ${request.id.slice(0, 8)}, ${request.objects.length} objects)`);
+
+        for (const admin of admins) {
+            this.sendToUser(admin, 'save:request', this.saveRequestView(request));
+        }
+
+        this.sendToUser(user, 'save:status', { requestId: request.id, status: 'pending', text: 'Waiting for a session admin to approve your save' });
+    }
+
+
+    saveRequestView(request) {
+
+        return {
+            requestId: request.id,
+            by: request.by,
+            name: request.name,
+            objectCount: request.objects.length,
+            text: `${request.by.name} wants to save this session. Allow?`
+        };
+    }
+
+
+    // The first admin's answer counts; later ones (another admin, a
+    // double click, a resend after a reconnect) only hear the result
+    async answerSave(client, admin, requestId, approve) {
+
+        const request = this.saveRequests?.get(String(requestId || ''));
+
+        if (!request || request.status !== 'pending') {
+            return client.send('save:resolved', { requestId, status: request?.status || 'unknown' });
+        }
+
+        if (!approve) {
+            return this.resolveSave(request, 'declined', admin, `${admin.name} declined your save; nothing was saved.`);
+        }
+
+        request.status = 'saving';
+        clearTimeout(request.timer);
+
+        const version = await this.save({ name: request.name, description: request.description, auto: false },
+            { userId: request.by.userId, name: request.by.name }, request);
+
+        console.log(`[${this.roomId}] ${admin.name} approved the save of ${request.by.name} (request ${request.id.slice(0, 8)}): ` +
+            `${version ? 'saved' : 'failed'}`);
+
+        this.resolveSave(request, version ? 'approved' : 'failed', admin, version
+            ? `${admin.name} approved your save: "${request.name}" is saved.`
+            : `${admin.name} approved your save, but saving failed: ${this.saveError || 'please try again'}.`);
+    }
+
+
+    resolveSave(request, status, admin, text) {
+
+        if (request.status !== 'pending' && request.status !== 'saving') {
+            return;
+        }
+
+        request.status = status;
+        clearTimeout(request.timer);
+        request.objects = null;
+
+        const requester = this.users.get(request.by.userId);
+
+        if (requester) {
+            this.sendToUser(requester, 'save:status', { requestId: request.id, status, text });
+        }
+
+        for (const user of this.onlineUsers('admin')) {
+            this.sendToUser(user, 'save:resolved', { requestId: request.id, status, by: admin?.name || null });
+        }
+
+        // Kept a while for late answers ("already approved"), then dropped
+        setTimeout(() => this.saveRequests?.delete(request.id), 10 * 60000).unref?.();
+    }
+
+
+    // An admin arrives (or becomes admin): the requests still open
+    sendSaveRequests(user) {
+
+        for (const request of this.saveRequests?.values() || []) {
+            if (request.status === 'pending') {
+                this.sendToUser(user, 'save:request', this.saveRequestView(request));
+            }
+        }
+    }
+
+
+    // The last admin left and nobody took over: say so, save nothing
+    checkSaveApprovers() {
+
+        if (this.onlineUsers('admin').length) {
+            for (const admin of this.onlineUsers('admin')) {
+                this.sendSaveRequests(admin);
+            }
+            return;
+        }
+
+        for (const request of this.saveRequests?.values() || []) {
+            if (request.status === 'pending') {
+                this.resolveSave(request, 'no-admin', null,
+                    'The session admin left before answering; nothing was saved. Ask again when an admin is here.');
             }
         }
     }

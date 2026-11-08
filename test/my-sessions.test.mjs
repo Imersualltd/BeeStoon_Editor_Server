@@ -324,7 +324,10 @@ async function main() {
     bob.send('object:add', { id: 'chair', name: 'chair.glb', assetId: chair.json.assetId, transform: pose(1) });
     await waitFor(() => objectIn(ada, 'chair'), 'chair added');
 
+    // An editor's save, approved by the admin (save-approval.test.mjs)
     bob.send('scene:save', { name: 'First layout', description: 'Chair by the door' });
+    await waitFor(() => ada.got('save:request'), 'admin asked');
+    ada.send('save:approve', { requestId: ada.messages.filter((m) => m.type === 'save:request').at(-1).payload.requestId });
     await waitFor(() => ada.got('scene:saved'), 'saved');
 
     const saved = (await mine('Bob')).json.saved;
