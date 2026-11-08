@@ -40,6 +40,13 @@
  *                         also on join and after a version restore.
  *                         Saved with every version; the GLB file is
  *                         never changed.
+ *     'credits:withdraw'  { amount, requestId }  (admins; the pool kept by
+ *                         BeeStoon, EDITOR_POOL=on) unused credits back to
+ *                         the admin who put them in. credits:add takes a
+ *                         requestId too; a repeat with the same id moves
+ *                         nothing again. Answers: 'credits:done' { requestId,
+ *                         action, replayed, mine, balance, history } or
+ *                         'credits:failed' { requestId, reason, withdrawable }
  *     'credits:refresh'   {}  re-read my balance (after a BeeStoon
  *                         purchase or import), new session:state
  *     'sync-request'      { have?: [id, ...] }
@@ -169,7 +176,7 @@ import { Room, ServerError } from 'colyseus';
 
 import { getAuthAdapter } from './auth/index.mjs';
 import { ACCESS_REMOVED_CODE, AccessError, requireAccess } from './editor-access.mjs';
-import { arSharingEnabled } from './ar-share.mjs';
+import { arSharingEnabled, revokeSessionLinks } from './ar-share.mjs';
 import { downloadModel, INSERTION_ID, InsertionError, insertionApi } from './insertions.mjs';
 import { cleanEmail } from './auth/util.mjs';
 import { mailerReady, sendInvite } from './mailer.mjs';
@@ -179,10 +186,11 @@ const GLB_MAGIC = 0x46546C67;   // "glTF" (assets.mjs)
 import { SESSION_TYPES, sessionTypeOf, upgradeCost } from './session-types.mjs';
 import { getSceneStorage } from './scene-storage.mjs';
 import {
-    balanceOf, charge, creditsEnabled, ENTRY_COST, generationChargeEnabled,
+    balanceOf, beestoonPool, beestoonPoolEnabled, charge, creditsEnabled, ENTRY_COST, generationChargeEnabled,
     generationCost, MAX_POOL, PAID_FEATURES, paidFeatureEnabled, paidFeatureMessage,
-    poolFromOptions, SESSION_COSTS
+    personalBalance, poolFromOptions, SESSION_COSTS
 } from './credits.mjs';
+import { readRecord, recordOf, writeRecord } from './session-records.mjs';
 import { cleanMaterials, cleanMaterialPatch, mergeMaterial, texturesOf } from './materials.mjs';
 import {
     cleanText,
@@ -195,6 +203,7 @@ import {
     updateScene
 } from './scene-versions.mjs';
 import {
+    isClosed,
     issueTicket,
     markClosed,
     registerSession,
@@ -243,6 +252,12 @@ const SAVE_COOLDOWN_SECONDS = 3;
 const ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
 
 const ROLES = ['admin', 'editor', 'viewer'];
+
+// An account in the logs, without printing the whole id
+function shortId(userId) {
+    const text = String(userId || '');
+    return text.length > 14 ? `${text.slice(0, 12)}…` : text;
+}
 
 // Email invites: addresses per message, and per
 // session per hour (spam brake)
@@ -305,8 +320,27 @@ export class ModelRoom extends Room {
             console.error(`Could not read saved sessions: ${error.message}`);
         }
 
+        // Who belonged to this session before (owner, members,
+        // removed people), also when it was never saved: a
+        // server restart must not give it to whoever is back first
+        const record = await readRecord(sessionKey);
+
+        if (record?.closedByAdmin && !saved) {
+            console.log(`[${this.roomId}] refused to re-create ${sessionKey}: closed by an admin at ${record.closedByAdmin}`);
+            throw new ServerError(410, 'This session has been closed');
+        }
+
+        // Closed by an admin (now, or before a restart): only its
+        // owner opens it again. Otherwise members may too.
+        this.closedBefore = !!record?.closedByAdmin || isClosed(sessionKey);
+
         // Throws if the key is already in use
-        registerSession(sessionKey, this, { reopen: !!saved });
+        try {
+            registerSession(sessionKey, this, { reopen: !!saved });
+        } catch (error) {
+            console.log(`[${this.roomId}] refused to create ${sessionKey}: ${error.code || ''} ${error.message}`);
+            throw error;
+        }
 
         this.sessionKey = sessionKey;
 
@@ -314,15 +348,27 @@ export class ModelRoom extends Room {
         // until the session is saved for the first time
         this.scene = saved;
 
-        this.sessionType = saved ? sessionTypeOf(saved.sessionType) : sessionTypeOf(options?.sessionType);
+        this.sessionType = saved
+            ? sessionTypeOf(saved.sessionType)
+            : sessionTypeOf(record?.sessionType || options?.sessionType);
 
         this.sessionName = saved
             ? saved.name
-            : cleanText(options?.sessionName, 80) || 'Untitled session';
+            : record?.sessionName || cleanText(options?.sessionName, 80) || 'Untitled session';
 
         // The creator owns the session for good, whoever
         // is admin later
-        this.owner = saved ? saved.owner : null;
+        this.owner = saved?.owner || record?.owner || null;
+
+        // Approved people, online or not: userId -> { name, role }.
+        // They come back with their role, without asking again.
+        this.known = new Map(Object.entries({ ...(saved?.attendees || {}), ...(record?.members || {}) })
+            .filter(([, m]) => m && ROLES.includes(m.role))
+            .map(([userId, m]) => [userId, { name: m.name, role: m.role }]));
+
+        this.recordCreatedAt = record?.createdAt || new Date().toISOString();
+        this.closedByAdmin = null;
+        this.recordWritten = null;
 
         this.limits = SESSION_TYPES[this.sessionType];
 
@@ -332,7 +378,19 @@ export class ModelRoom extends Room {
             ? { total: 0, left: 0, forEntry: false, forModels: false, ...saved.credits }
             : poolFromOptions(options);
 
-        this.creatorCharged = !!saved;
+        // EDITOR_POOL=on: the pool is BeeStoon's (credits.mjs), read
+        // from there now and after every change, never kept here
+        this.poolBacked = beestoonPoolEnabled();
+
+        if (this.poolBacked) {
+            this.credits = { total: 0, left: 0, reserved: 0, spent: 0, forEntry: false, forModels: false };
+            this.poolHistory = [];
+            this.refreshPool();
+        }
+
+        // A session that existed before (saved, or recorded
+        // before a server restart) was paid for when it started
+        this.creatorCharged = !!saved || !!record;
 
         // People who paid their entry (or the pool did).
         // Earlier attendees of a saved session already did.
@@ -386,8 +444,9 @@ export class ModelRoom extends Room {
         // Times (ms) invites were sent, for the limit
         this.inviteTimes = [];
 
-        // Kicked users cannot come back
-        this.banned = new Set();
+        // Removed by an admin: they can only ask to join again
+        // (kept with the record and the saved session)
+        this.banned = new Set([...(record?.removed || []), ...(saved?.removed || [])]);
 
         // id -> { id, name, assetId, size, url, transform,
         //         addedBy, assignedTo, heldBy }
@@ -440,9 +499,66 @@ export class ModelRoom extends Room {
 
 
         console.log(
-            `[${this.roomId}] ${this.sessionType} session ${sessionKey} ${saved ? 're-opened' : 'created'} ` +
-            `(${this.limits.people} people, ${mb(this.limits.maxBytes)} MB of models)`
+            `[${this.roomId}] ${this.sessionType} session ${sessionKey} ${saved ? 're-opened' : record ? 'restored' : 'created'} ` +
+            `(${this.limits.people} people, ${mb(this.limits.maxBytes)} MB of models)` +
+            (saved || record
+                ? `; owner ${this.owner ? shortId(this.owner.userId) : 'none'}, ${this.known.size} member(s), ` +
+                  `${this.banned.size} removed`
+                : '')
         );
+    }
+
+
+    // Keep the session record in step with who belongs (written
+    // only when it changed; see session-records.mjs)
+    /*
+     * Writes the record 300 ms after a change, or at once
+     * (now = true) when membership changed: an approval or
+     * a removal must survive a restart that comes right
+     * after it (Render stops the old instance on deploy).
+     */
+    recordChanged(now = false) {
+
+        if (!this.owner) {
+            return;
+        }
+
+        if (now) {
+            clearTimeout(this.recordTimer);
+            this.recordTimer = null;
+            this.writeRecordNow();
+            return;
+        }
+
+        if (this.recordTimer) {
+            return;
+        }
+
+        this.recordTimer = setTimeout(() => {
+            this.recordTimer = null;
+            this.writeRecordNow();
+        }, 300);
+    }
+
+
+    // Resolves when the record is stored (or nothing changed)
+    writeRecordNow() {
+
+        const record = recordOf(this);
+        const text = JSON.stringify(record);
+
+        if (text === this.recordWritten) {
+            return this.recordWrite || Promise.resolve();
+        }
+
+        this.recordWritten = text;
+
+        this.recordWrite = writeRecord(this.sessionKey, record).catch((error) => {
+            this.recordWritten = null;
+            console.error(`[${this.roomId}] Could not keep the session record: ${error.message}`);
+        });
+
+        return this.recordWrite;
     }
 
 
@@ -465,6 +581,9 @@ export class ModelRoom extends Room {
         try {
             identity = await getAuthAdapter().verify({ token, options });
         } catch (error) {
+            // Never the token itself: why it failed (expired, bad signature ...)
+            console.log(`[auth] refused a join of ${String(options?.sessionKey || '?').slice(0, 64)}: ` +
+                `login failed (${error.message}); token ${token ? 'present' : 'missing'}`);
             throw new ServerError(401, `Login failed: ${error.message}`);
         }
 
@@ -482,6 +601,17 @@ export class ModelRoom extends Room {
 
 
     async onAuth(client, options, context) {
+
+        try {
+            return await this.admit(client, options, context);
+        } catch (error) {
+            console.log(`[${this.roomId}] refused a join of ${this.sessionKey}: ${error.code || ''} ${error.message}`);
+            throw error;
+        }
+    }
+
+
+    async admit(client, options, context) {
 
         if (this.closed) {
             throw new ServerError(410, 'This session has been closed');
@@ -513,11 +643,15 @@ export class ModelRoom extends Room {
             throw error;
         }
 
-        // Only the owner opens a saved session again
-        if (this.scene && !this.hasCreator && identity.userId !== this.owner.userId) {
+        // A saved session nobody is in yet opens again for its
+        // owner or someone approved in it before; anyone else
+        // would wait for an admin who is not there
+        if (this.scene && !this.hasCreator && identity.userId !== this.owner?.userId &&
+            (this.closedBefore || !this.known.has(identity.userId) || this.banned.has(identity.userId))) {
+            console.log(`[${this.roomId}] refused ${shortId(identity.userId)}: saved session, not a member, nobody in`);
             throw new ServerError(
                 403,
-                `This session is closed. Only its owner (${this.owner.name}) can open it again.`
+                `This session is closed. Only its owner (${this.owner?.name || 'its owner'}) can open it again.`
             );
         }
 
@@ -632,6 +766,20 @@ export class ModelRoom extends Room {
             return;
         }
 
+        if (this.poolBacked) {
+            // Charged once under this key, by the pool or the person, never both
+            const answer = await beestoonPool.charge(this.sessionKey, {
+                userId: person.userId, amount: ENTRY_COST, key: this.chargeKey(`entry:${person.userId}`),
+                purpose: 'entry', reason: `Joined "${this.sessionName}"`
+            });
+            this.applyPool(answer);
+            if (answer.paidBy === 'self') {
+                person.balance = await personalBalance(person.userId);
+            }
+            this.entryPaid.add(person.userId);
+            return;
+        }
+
         if (this.poolPaysEntry()) {
 
             this.credits.left -= ENTRY_COST;
@@ -660,6 +808,21 @@ export class ModelRoom extends Room {
 
         if (!creditsEnabled()) {
             return 'free';
+        }
+
+        if (this.poolBacked) {
+            // One key per generation: the pool or the person pays it, once
+            const answer = await beestoonPool.charge(this.sessionKey, {
+                userId, amount, key: this.chargeKey(`generation:${requestId}`),
+                purpose: 'models', reason: `${reason} in "${this.sessionName}"`
+            });
+            this.applyPool(answer);
+            const user = this.users.get(userId);
+            if (user && answer.paidBy === 'self') {
+                user.balance = await personalBalance(userId);
+                this.sendState();
+            }
+            return answer.paidBy;
         }
 
         if (this.credits.forModels && this.credits.left >= amount) {
@@ -760,6 +923,126 @@ export class ModelRoom extends Room {
     }
 
 
+    // ==============================================
+    // CREDIT POOL KEPT BY BEESTOON (EDITOR_POOL=on)
+    // ==============================================
+
+    async refreshPool() {
+
+        try {
+            this.applyPool(await beestoonPool.read(this.sessionKey));
+        } catch (error) {
+            console.error(`[${this.roomId}] Could not read the credit pool: ${error.message}`);
+        }
+    }
+
+
+    // BeeStoon's numbers -> what every client shows
+    applyPool(p) {
+
+        if (!p) {
+            return;
+        }
+
+        this.credits = {
+            total: Math.max(0, Math.round((p.deposited - p.withdrawn) * 1000) / 1000),
+            left: p.available,
+            reserved: p.reserved,
+            spent: p.spent,
+            forEntry: !!p.forEntry,
+            forModels: !!p.forModels
+        };
+
+        this.poolHistory = Array.isArray(p.history) ? p.history : this.poolHistory;
+
+        if (!this.closed) {
+            this.sendState();
+        }
+    }
+
+
+    // An admin's own part of the pool (what they may take back), their
+    // balance and the history: to that person only
+    async sendMyPool(user) {
+
+        try {
+            const p = await beestoonPool.read(this.sessionKey, user.userId);
+            if (p.personalBalance !== undefined && p.personalBalance !== null) {
+                user.balance = p.personalBalance;
+            }
+            this.applyPool(p);
+            this.sendToUser(user, 'credits:mine', {
+                mine: p.mine || null,
+                balance: user.balance ?? null,
+                history: user.role === 'admin' ? this.poolHistory : []
+            });
+        } catch (error) {
+            console.error(`[${this.roomId}] Could not read the credit pool for "${user.name}": ${error.message}`);
+        }
+    }
+
+
+    /*
+     * Add or withdraw (admins; onAdmin checked the role on this
+     * server). The client sends a request id it keeps until the
+     * transfer is answered: a retry after a reconnect, or a second
+     * click, sends the same id, which is the same BeeStoon key, so
+     * the credits move once. BeeStoon refuses withdrawals of spent
+     * or reserved credits and of credits other people put in.
+     */
+    async poolTransfer(client, admin, action, data) {
+
+        const type = action === 'add' ? 'credits:add' : 'credits:withdraw';
+        const amount = Math.floor(Number(data?.amount));
+        const requestId = String(data?.requestId || '');
+
+        if (!Number.isFinite(amount) || amount < 1 || amount > MAX_POOL) {
+            return this.actionDenied(client, type, 'Not a valid amount');
+        }
+
+        if (!/^[A-Za-z0-9_-]{8,64}$/.test(requestId)) {
+            return this.actionDenied(client, type, 'Not a valid request');
+        }
+
+        const key = `pool:${this.sessionKey}:${action}:${requestId}`;
+
+        try {
+
+            const answer = action === 'add'
+                ? await beestoonPool.deposit(this.sessionKey, admin.userId, amount, key)
+                : await beestoonPool.withdraw(this.sessionKey, admin.userId, amount, key);
+
+            if (answer.personalBalance !== undefined && answer.personalBalance !== null) {
+                admin.balance = answer.personalBalance;
+            }
+
+            this.applyPool(answer);
+
+            console.log(
+                `[${this.roomId}] ${admin.name} ${action === 'add' ? 'added' : 'withdrew'} ${amount} credit(s) ` +
+                `${action === 'add' ? 'to' : 'from'} the pool (request ${requestId.slice(0, 8)}` +
+                `${answer.replayed ? ', a repeat: nothing moved again' : ''})`
+            );
+
+            this.sendToUser(admin, 'credits:done', {
+                requestId, action, amount, replayed: !!answer.replayed,
+                mine: answer.mine || null, balance: admin.balance ?? null, history: this.poolHistory
+            });
+
+        } catch (error) {
+
+            console.log(`[${this.roomId}] ${action} of ${amount} pool credit(s) by ${admin.name} refused: ${error.message}`);
+
+            client.send('credits:failed', {
+                requestId, action, reason: error.userMessage || 'Could not move the credits',
+                withdrawable: error.withdrawable ?? null
+            });
+
+            this.actionDenied(client, type, error.userMessage || 'Could not move the credits');
+        }
+    }
+
+
     onJoin(client) {
 
         const { userId, name, email = null, balance = null } = client.auth;
@@ -796,9 +1079,10 @@ export class ModelRoom extends Room {
 
                 console.log(`[${this.roomId}] "${name}" was removed earlier and asks to join again`);
 
-            } else if (!this.hasCreator) {
+            } else if (this.owner ? userId === this.owner.userId : !this.hasCreator) {
 
-                // The creator of the session is its first admin
+                // The owner (its creator) is always admin, also when
+                // the room comes back after a server restart
 
                 this.hasCreator = true;
 
@@ -807,12 +1091,15 @@ export class ModelRoom extends Room {
                 user.status = 'approved';
                 user.role = 'admin';
 
-            } else if (this.scene?.attendees?.[userId]?.role) {
+            } else if (this.known.has(userId)) {
 
-                // Was in this saved session before: back in
-                // with the same role, no waiting
+                // Approved here before (before a refresh, a server
+                // restart, or in the saved session): back in with
+                // the same role, no waiting
+                this.hasCreator = true;
+
                 user.status = 'approved';
-                user.role = this.scene.attendees[userId].role;
+                user.role = this.known.get(userId).role;
 
             } else if (email && this.inviteRole(email)) {
 
@@ -841,6 +1128,15 @@ export class ModelRoom extends Room {
 
         if (balance !== null && balance !== undefined) {
             user.balance = balance;
+        } else if (this.poolBacked && user.balance === undefined) {
+            // The pool panel shows each person's own BeeStoon balance
+            user.balance = null;
+            personalBalance(userId).then((value) => {
+                if (value !== null && value !== undefined && this.users.get(userId) === user) {
+                    user.balance = value;
+                    this.sendState();
+                }
+            });
         }
 
         user.lastActive = Date.now();
@@ -972,15 +1268,18 @@ export class ModelRoom extends Room {
         this.releaseHoldsOf(user.userId);
 
 
-        // The last admin is gone: admin goes to the
-        // oldest editor; with no editor the session ends
+        // The last admin is gone: admin goes to the oldest
+        // editor. With no editor the session stays as it is: an
+        // admin coming back (a refresh, the network back, a laptop
+        // waking up) carries on. The room ends by itself when
+        // nobody is left, and opens again for its members. Only an
+        // admin's "Close session" closes it (it used to close here,
+        // which shut the owner out for 24 hours after any absence
+        // longer than the reconnection window).
         if (user.role === 'admin' && user.status === 'approved' && this.onlineUsers('admin').length === 0) {
 
             if (!this.handOverAdmin(user)) {
-
-                this.closeSession(user);
-
-                return;
+                console.log(`[${this.roomId}] last admin "${user.name}" left; the session stays open for its members`);
             }
         }
 
@@ -1029,6 +1328,14 @@ export class ModelRoom extends Room {
         }
 
         unregisterSession(this.sessionKey, this);
+
+        // A change still waiting for its 300 ms (shutting
+        // down: Colyseus waits for onDispose)
+        if (this.owner) {
+            clearTimeout(this.recordTimer);
+            this.recordTimer = null;
+            await this.writeRecordNow();
+        }
 
         // Keep the last state of the session
         if (this.dirty) {
@@ -1218,6 +1525,17 @@ export class ModelRoom extends Room {
 
 
         this.onApproved('credits:refresh', async (client, user) => {
+
+            if (this.poolBacked) {
+
+                if (Date.now() - (user.creditsReadAt || 0) < 1000) {
+                    return;
+                }
+
+                user.creditsReadAt = Date.now();
+
+                return this.sendMyPool(user);
+            }
 
             if (!creditsEnabled() || Date.now() - (user.creditsReadAt || 0) < 3000) {
                 return;
@@ -1476,6 +1794,10 @@ export class ModelRoom extends Room {
         // Put more of the admin's credits into the pool
         this.onAdmin('credits:add', async (client, admin, data) => {
 
+            if (this.poolBacked) {
+                return this.poolTransfer(client, admin, 'add', data);
+            }
+
             if (!paidFeatureEnabled('pool')) {
                 return this.actionDenied(client, 'credits:add', paidFeatureMessage('pool'));
             }
@@ -1634,7 +1956,39 @@ export class ModelRoom extends Room {
 
 
         // What the pool pays for
-        this.onAdmin('credits:pool', (client, admin, data) => {
+        // Unused pool credits back to the admin who put them in
+        this.onAdmin('credits:withdraw', async (client, admin, data) => {
+
+            if (!this.poolBacked) {
+                return this.actionDenied(client, 'credits:withdraw', 'Taking credits back from the pool is not available here');
+            }
+
+            return this.poolTransfer(client, admin, 'withdraw', data);
+        });
+
+
+        this.onAdmin('credits:pool', async (client, admin, data) => {
+
+            if (this.poolBacked) {
+
+                const settings = {};
+
+                if (typeof data?.forEntry === 'boolean') {
+                    settings.forEntry = data.forEntry;
+                }
+
+                if (typeof data?.forModels === 'boolean') {
+                    settings.forModels = data.forModels;
+                }
+
+                try {
+                    this.applyPool(await beestoonPool.settings(this.sessionKey, settings));
+                } catch (error) {
+                    this.actionDenied(client, 'credits:pool', error.userMessage || 'Could not change what the pool pays for');
+                }
+
+                return;
+            }
 
             if (!paidFeatureEnabled('pool')) {
                 return this.actionDenied(client, 'credits:pool', paidFeatureMessage('pool'));
@@ -1804,6 +2158,10 @@ export class ModelRoom extends Room {
 
 
             this.banned.add(user.userId);
+
+            this.known.delete(user.userId);
+
+            this.recordChanged(true);
 
             this.users.delete(user.userId);
 
@@ -2141,7 +2499,14 @@ export class ModelRoom extends Room {
 
         markClosed(this.sessionKey);
 
+        // Survives a server restart (the record)
+        this.closedByAdmin = new Date().toISOString();
+        this.recordChanged();
+
         console.log(`[${this.roomId}] session closed by ${byUser.name}`);
+
+        // Its AR links stop too (ar-share.mjs)
+        revokeSessionLinks(this.sessionKey);
 
 
         this.lock();
@@ -2934,14 +3299,17 @@ export class ModelRoom extends Room {
             // Where this session's files are (texture links for
             // material edits); downloads still need a ticket
             sceneId: this.sceneId,
-            credits: creditsEnabled()
+            credits: creditsEnabled() || this.poolBacked
                 ? {
                     pool: {
                         total: this.credits.total,
                         left: this.credits.left,
                         forEntry: this.credits.forEntry,
-                        forModels: this.credits.forModels
+                        forModels: this.credits.forModels,
+                        ...(this.poolBacked ? { reserved: this.credits.reserved || 0, spent: this.credits.spent || 0 } : {})
                     },
+                    // Kept by BeeStoon: withdrawals and history are available
+                    beestoon: !!this.poolBacked,
                     // This person's own credits
                     balance: user.balance ?? null,
                     entryCost: ENTRY_COST,
@@ -2961,7 +3329,9 @@ export class ModelRoom extends Room {
                 // scene:save / scene:versions / scene:restore
                 versions: true,
                 // credits:add / credits:pool (admins)
-                credits: creditsEnabled() && paidFeatureEnabled('pool'),
+                credits: (creditsEnabled() && paidFeatureEnabled('pool')) || !!this.poolBacked,
+                // credits:withdraw (admins; the pool kept by BeeStoon)
+                poolWithdraw: !!this.poolBacked,
                 // session:upgrade (admins)
                 sessionUpgrade: paidFeatureEnabled('upgrade'),
                 // object:material (material/texture sync)
@@ -2998,6 +3368,21 @@ export class ModelRoom extends Room {
 
 
     sendState() {
+
+        // Approved people are members for good (until removed)
+        let membersChanged = false;
+
+        for (const user of this.users.values()) {
+            if (user.status === 'approved' && user.role) {
+                const known = this.known.get(user.userId);
+                if (!known || known.role !== user.role || known.name !== user.name) {
+                    this.known.set(user.userId, { name: user.name, role: user.role });
+                    membersChanged = true;
+                }
+            }
+        }
+
+        this.recordChanged(membersChanged);
 
         for (const user of this.users.values()) {
 

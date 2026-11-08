@@ -6,7 +6,7 @@
   "main": "src/index.mjs",
   "scripts": {
     "start": "node src/index.mjs",
-    "test": "node test/roles.test.mjs && node test/ar-share.test.mjs && node test/assets.test.mjs && node test/versions.test.mjs && node test/admin-rules.test.mjs && node test/my-sessions.test.mjs && node test/credits.test.mjs && node test/upgrade.test.mjs && node test/beestoon.test.mjs && node test/materials.test.mjs && node test/pool.test.mjs && node test/identity-migration.test.mjs && node test/editor-access.test.mjs && node test/insertions.test.mjs && node test/session-files.test.mjs && node test/mailer.test.mjs"
+    "test": "node test/roles.test.mjs && node test/ar-share.test.mjs && node test/assets.test.mjs && node test/versions.test.mjs && node test/admin-rules.test.mjs && node test/my-sessions.test.mjs && node test/credits.test.mjs && node test/upgrade.test.mjs && node test/beestoon.test.mjs && node test/materials.test.mjs && node test/pool.test.mjs && node test/identity-migration.test.mjs && node test/editor-access.test.mjs && node test/insertions.test.mjs && node test/session-files.test.mjs && node test/mailer.test.mjs && node test/reconnect.test.mjs && node test/pool-beestoon.test.mjs"
   },
   "engines": {
     "node": ">=22"

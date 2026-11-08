@@ -50,11 +50,23 @@ services:
       # BeeStoon's Postmark (the API's SMTP settings)
       - key: CREDITS_PROVIDER
         value: beestoon
+      # Session credit pool kept by BeeStoon (beestoon-backend editor_pool):
+      # admins add and withdraw credits in the Credits panel. Independent of
+      # CREDITS_ENABLED (session and entry prices can stay off). Turn on
+      # after the backend with the editor_pool migration is deployed.
+      - key: EDITOR_POOL
+        value: "on"
       - key: CREDITS_ENABLED
         value: "false"
       # EDITOR_PAID_FEATURES unset: every paid editor feature is off
+      # AR button -> Selected objects / All scene -> QR code for
+      # a phone. "on" makes snapshot-only links (the chosen GLB,
+      # textures inside; nothing else of the session), 2 h, at
+      # most 30 per session an hour, deleted when an admin closes
+      # the session (ar-share.mjs). Off: AR on the member's own
+      # phone or tablet only.
       - key: AR_SHARING
-        value: "off"
+        value: "on"
       - key: MAIL_PROVIDER
         value: beestoon
       # Saved sessions and model files: Spaces

@@ -21,6 +21,8 @@ import { registerInternalRoutes } from './internal.mjs';
 import { accessProblems, startAccessRecheck } from './editor-access.mjs';
 import { liveRooms } from './sessions.mjs';
 
+const STARTED_AT = new Date();
+
 
 const PORT = Number(process.env.PORT) || 2567;
 
@@ -95,11 +97,18 @@ const server = defineServer({
 
         // Health check for the hosting platform and
         // a quick "is it up?" test in the browser.
+        // startedAt / uptime show a restart (Render deploy, a free
+        // instance spinning down): every room starts again from its
+        // session record then. No user data here.
         app.get('/', (req, res) => {
             res.json({
                 ok: true,
                 service: 'beestoon-editor-server',
-                time: new Date().toISOString()
+                time: new Date().toISOString(),
+                startedAt: STARTED_AT.toISOString(),
+                uptimeSeconds: Math.round((Date.now() - STARTED_AT.getTime()) / 1000),
+                commit: (process.env.RENDER_GIT_COMMIT || '').slice(0, 12) || null,
+                liveSessions: liveRooms().length
             });
         });
 
@@ -130,6 +139,6 @@ const server = defineServer({
 
 
 server.listen(PORT, HOST).then(() => {
-    console.log(`Multiplayer server listening on ${HOST}:${PORT}`);
+    console.log(`Multiplayer server listening on ${HOST}:${PORT} (started ${STARTED_AT.toISOString()}${process.env.RENDER_GIT_COMMIT ? `, commit ${process.env.RENDER_GIT_COMMIT.slice(0, 12)}` : ''})`);
     startAccessRecheck(liveRooms);
 });

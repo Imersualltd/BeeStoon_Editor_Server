@@ -12,7 +12,7 @@
  */
 
 import { spawn } from 'node:child_process';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
@@ -93,7 +93,8 @@ const server = spawn(process.execPath, ['src/index.mjs'], {
         SCENE_STORAGE: 'local',
         SCENE_LOCAL_DIR: path.join(storeDir, 'scenes'),
         // about 2 seconds
-        AR_LINK_HOURS: String(2 / 3600)
+        AR_LINK_HOURS: String(2 / 3600),
+        AR_LINKS_PER_HOUR: '5'
     },
     stdio: ['ignore', 'pipe', 'pipe']
 });
@@ -182,6 +183,24 @@ async function main() {
         assert.ok(bytes.equals(fakeGlb()));
     });
 
+    check('link pages are not indexed nor passed on as a referrer, the model not cached past the link', () => {
+        for (const r of [page, model]) {
+            assert.equal(r.headers.get('x-robots-tag'), 'noindex, nofollow');
+            assert.equal(r.headers.get('referrer-policy'), 'no-referrer');
+        }
+        assert.match(model.headers.get('cache-control'), /^private, max-age=[0-2]$/);
+    });
+
+    const meta = JSON.parse(await readFile(path.join(storeDir, reply.id, 'meta.json'), 'utf8'));
+
+    check('only the snapshot is public: the session is known on the server, never on the page', () => {
+        assert.equal(meta.sessionKey, 'ar-test-session-01');
+        assert.equal(meta.createdBy, state.you.userId);
+        assert.ok(!html.includes('ar-test-session-01'));
+        assert.ok(!html.includes(state.you.userId));
+        assert.ok(!JSON.stringify(reply).includes('ar-test-session-01'));
+    });
+
 
     const unknown = await fetch(`${URL}/ar/${'x'.repeat(30)}`);
     check('an unknown link shows the expired page (410)', () => assert.equal(unknown.status, 410));
@@ -195,6 +214,55 @@ async function main() {
     check('after it expires the link and model are gone (410)', () => {
         assert.equal(expired.status, 410);
         assert.equal(expiredModel.status, 410);
+    });
+
+
+    // Someone waiting for approval has a ticket but no snapshot
+    const waiting = await new Client(URL).join('session', {
+        sessionKey: 'ar-test-session-01',
+        identity: { userId: 'zoe', name: 'Zoe' }
+    });
+    let zoeState = null;
+    waiting.onMessage('*', (type, payload) => {
+        if (type === 'session:state') {
+            zoeState = payload;
+        }
+    });
+    await waitFor(() => zoeState?.you, 'pending state');
+    const pendingUpload = zoeState.you.ticket ? await upload(fakeGlb(), zoeState.you.ticket) : { status: 401 };
+    check('someone still waiting for approval cannot make a link', () => assert.ok([401, 403].includes(pendingUpload.status)));
+    await waiting.leave();
+
+
+    console.log('\nA session makes a limited number of links');
+    const statuses = [];
+    for (let i = 0; i < 5; i++) {
+        statuses.push((await upload(fakeGlb(), ticket)).status);
+    }
+    check('the 6th link within the hour is refused (429), the first five worked', () => {
+        assert.deepEqual(statuses, [200, 200, 200, 200, 429]);
+    });
+
+
+    console.log('\nClosing the session stops its links');
+    const client2 = new Client(URL);
+    const room2 = await client2.create('session', {
+        sessionKey: 'ar-test-session-02',
+        identity: { userId: 'ada', name: 'Ada' }
+    });
+    let state2 = null;
+    room2.onMessage('*', (type, payload) => {
+        if (type === 'session:state') {
+            state2 = payload;
+        }
+    });
+    await waitFor(() => state2?.you?.ticket, 'second ticket');
+    const live = await (await upload(fakeGlb(), state2.you.ticket)).json();
+    check('the link works while the session is open', () => assert.ok(live.url));
+    room2.send('session:close');
+    await waitFor(async () => (await fetch(live.url)).status === 410, 'link gone after close', 1500);
+    check('after the admin closes the session the link answers 410 before it would expire', () => {
+        assert.match(serverLog, /1 link\(s\) of session ar-tes\.\.\. deleted \(session closed\)/);
     });
 
 

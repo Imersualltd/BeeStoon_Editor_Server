@@ -102,7 +102,7 @@ export function markClosed(sessionKey) {
 }
 
 
-function isClosed(sessionKey) {
+export function isClosed(sessionKey) {
 
     const time = closedKeys.get(sessionKey);
 
@@ -186,6 +186,9 @@ export function requireMember(req, res, next) {
         res.status(403).send('Wait until an admin lets you in');
         return;
     }
+
+    // Who asked, for the handler (never sent back)
+    req.member = { sessionKey: entry.room.sessionKey, userId: entry.userId };
 
     next();
 }
