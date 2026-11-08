@@ -312,18 +312,29 @@ export class ModelRoom extends Room {
 
         // A saved session behind this link? Then this
         // room re-opens it (only its owner may, onAuth).
+        // A storage failure is not "never saved": opening the link as a
+        // new, empty session would hide the saved scene, and the next
+        // save would point the link at a new one. Refuse (503: the
+        // editor retries and says why) until storage answers.
         let saved = null;
 
         try {
             saved = await sceneOfKey(sessionKey);
         } catch (error) {
-            console.error(`Could not read saved sessions: ${error.message}`);
+            console.error(`[${this.roomId}] could not read the saved session of ${sessionKey}: ${error.message}`);
+            throw new ServerError(503, 'The saved session could not be read from storage. Trying again…');
         }
 
         // Who belonged to this session before (owner, members,
         // removed people), also when it was never saved: a
         // server restart must not give it to whoever is back first
-        const record = await readRecord(sessionKey);
+        let record;
+
+        try {
+            record = await readRecord(sessionKey, { strict: true });
+        } catch {
+            throw new ServerError(503, 'The session\'s members could not be read from storage. Trying again…');
+        }
 
         if (record?.closedByAdmin && !saved) {
             console.log(`[${this.roomId}] refused to re-create ${sessionKey}: closed by an admin at ${record.closedByAdmin}`);
@@ -476,7 +487,25 @@ export class ModelRoom extends Room {
 
         // A saved session starts from its newest version
         if (saved) {
-            await this.loadObjects(await latestVersion(saved));
+
+            let latest;
+
+            try {
+                latest = await latestVersion(saved);
+            } catch (error) {
+                unregisterSession(sessionKey, this);
+                console.error(`[${this.roomId}] could not read the newest version of ${sessionKey}: ${error.message}`);
+                throw new ServerError(503, 'The saved scene could not be read from storage. Trying again…');
+            }
+
+            await this.loadObjects(latest);
+
+            // Told to everyone who joins, like a missing model file
+            if (saved.versions?.length && !latest) {
+                console.warn(`[${this.roomId}] ${sessionKey}: its newest version file is missing; opening without its models`);
+                this.missingFiles.push({ name: saved.versions[saved.versions.length - 1].name || 'newest version',
+                    reason: 'the saved version file is no longer in storage; restore an earlier version from Versions' });
+            }
         }
 
 

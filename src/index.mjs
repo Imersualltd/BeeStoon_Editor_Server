@@ -13,6 +13,7 @@ import { getAuthAdapter, productionProblems } from './auth/index.mjs';
 import { registerConvertRoute } from './convert.mjs';
 import { registerExportFbxRoute } from './export-fbx.mjs';
 import { registerArShareRoutes } from './ar-share.mjs';
+import { installProxySafeMatchmaking } from './matchmake-errors.mjs';
 import { registerAssetRoutes } from './assets.mjs';
 import { registerMySessionsRoutes } from './my-sessions.mjs';
 import { registerCreditRoutes } from './credits.mjs';
@@ -69,6 +70,11 @@ if (allowedOrigins().length) {
         return origin ? { 'Access-Control-Allow-Origin': origin, Vary: 'Origin' } : { Vary: 'Origin' };
     };
 }
+
+
+// Join / create errors with statuses Render's proxy passes on
+// (matchmake-errors.mjs: 52x answers never reached the editor)
+installProxySafeMatchmaking(matchMaker.controller);
 
 
 const server = defineServer({

@@ -28,12 +28,17 @@ import { queued, readJson, writeJson } from './scene-versions.mjs';
 const recordKey = (sessionKey) => `records/${sessionKey}.json`;
 
 
-export async function readRecord(sessionKey) {
+export async function readRecord(sessionKey, { strict = false } = {}) {
 
     try {
         return await readJson(recordKey(sessionKey));
     } catch (error) {
         console.error(`Could not read the record of session ${sessionKey}: ${error.message}`);
+        // strict: storage failed (not "no record"); the caller must
+        // not carry on as if the session had no owner or members
+        if (strict) {
+            throw error;
+        }
         return null;
     }
 }
