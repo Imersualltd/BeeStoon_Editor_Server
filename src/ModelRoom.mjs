@@ -1641,6 +1641,10 @@ export class ModelRoom extends Room {
 
                 user.creditsReadAt = Date.now();
 
+                // Paid work the site charged to the pool directly (an
+                // unlock): everyone's pool line is read again
+                await this.refreshPool();
+
                 return this.sendMyPool(user);
             }
 
