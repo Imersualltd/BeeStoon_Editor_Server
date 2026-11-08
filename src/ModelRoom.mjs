@@ -1635,7 +1635,17 @@ export class ModelRoom extends Room {
 
             if (this.poolBacked) {
 
-                if (Date.now() - (user.creditsReadAt || 0) < 1000) {
+                // At most once a second per person; a request inside that
+                // second is answered once it is over (never dropped: it may
+                // follow an unlock the site just charged to the pool)
+                const wait = 1000 - (Date.now() - (user.creditsReadAt || 0));
+
+                if (wait > 0) {
+                    user.creditsTrailing = user.creditsTrailing || this.clock.setTimeout(() => {
+                        user.creditsTrailing = null;
+                        user.creditsReadAt = Date.now();
+                        this.refreshPool().then(() => this.sendMyPool(user));
+                    }, wait);
                     return;
                 }
 

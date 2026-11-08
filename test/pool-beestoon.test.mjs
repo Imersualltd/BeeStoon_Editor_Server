@@ -255,6 +255,16 @@ async function main() {
         assert.equal(mine.history.length, 2);
     });
 
+    console.log('\nThe pool charged from outside (an Unlock on the site) is read again');
+    ada.send('credits:refresh');
+    poolOf(KEY).balance -= 1; poolOf(KEY).spent += 1;                         // the API spent 1 for an unlock
+    ada.send('credits:refresh');                                             // within the same second
+    await waitFor(() => ada.state.credits.pool.left === 1 && bob.state.credits.pool.left === 1, 'refreshed after the limit', 4000);
+    check('a refresh inside the rate limit is answered once it is over, for everyone (not dropped)', () => {
+        assert.equal(ada.state.credits.pool.left, 1);
+        assert.equal(bob.state.credits.pool.left, 1);
+    });
+
     console.log('\nAfter a restart the pool is read from BeeStoon again');
     await ada.room.leave();
     await bob.room.leave();
@@ -262,7 +272,7 @@ async function main() {
     await sleep(500);
     await startServer();
     const ada2 = await connect('Ada', KEY, 'create').catch(() => connect('Ada', KEY));
-    await waitFor(() => ada2.state.credits?.pool?.left === 2, 'pool after restart');
+    await waitFor(() => ada2.state.credits?.pool?.left === 1, 'pool after restart');   // 2 in, 1 spent (unlock)
     check('the same pool, nothing kept in the editor server', () => assert.equal(ada2.state.credits.pool.total, 2));
 
     console.log('\nThe initial pool chosen when creating a session');
