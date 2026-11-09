@@ -29,6 +29,17 @@
  *     always deleted
  *   - assimp is killed if it runs too long
  *   - one conversion at a time (small free instance)
+ *
+ * Units: assimp 5.2 writes UnitScaleFactor 1 (centimetres)
+ * while glTF data is in metres, so Blender / Maya opened
+ * every export 100 times too small (checked in Blender
+ * 4.x). The FBX is marked as metres (fbxInMetres).
+ *
+ * Errors say what happened (too slow for the server,
+ * out of memory, assimp's own message, not installed)
+ * instead of only "FBX export failed"; the full assimp
+ * output goes to the server log. GET / reports whether
+ * assimp is available (fbxExport).
  */
 
 import express from 'express';
@@ -107,6 +118,7 @@ export function registerExportFbxRoute(app) {
     });
 
 
+    checkAssimp();
     console.log('GLB -> FBX export ready at POST /export/fbx');
 }
 
@@ -176,7 +188,7 @@ async function handleExport(req, res) {
         );
 
 
-        const fbx = await readFile(path.join(workDir, 'model.fbx'));
+        const fbx = fbxInMetres(await readFile(path.join(workDir, 'model.fbx')));
 
 
         if (!gltf.images.length) {
@@ -206,13 +218,10 @@ async function handleExport(req, res) {
 
     } catch (error) {
 
-        console.error(`[export-fbx] failed for ${baseName}:`, error.message);
-
-        if (error.code === 'ENOENT') {
-            res.status(501).send('FBX export is not installed on the server (assimp missing)');
-        } else {
-            res.status(500).send('FBX export failed');
-        }
+        console.error(`[export-fbx] failed for ${baseName} after ${((Date.now() - started) / 1000).toFixed(1)}s ` +
+            `(${formatMb(body.length)}, ${gltf.images.length} texture(s)):`, error.message.replaceAll(workDir, '<work>'));
+        const { status, text } = exportError(error);
+        res.status(status).send(text);
 
     } finally {
 
@@ -316,6 +325,92 @@ function sniffImage(data) {
 }
 
 
+/*
+ * What the person is told. Statuses Render's proxy passes on
+ * (never 520-527, see matchmake-errors.mjs).
+ */
+export function exportError(error) {
+
+    if (error.code === 'ENOENT') {
+        return { status: 501, text: 'FBX export is not installed on this server (the assimp converter is missing). Export GLB instead.' };
+    }
+
+    if (error.timedOut) {
+        return { status: 503, text: `FBX conversion took longer than ${EXPORT_TIMEOUT_MS / 1000} s on the server and was stopped. ` +
+            'Export fewer objects at once, or export GLB.' };
+    }
+
+    if (error.signal) {
+        return { status: 503, text: 'The server ran out of resources converting this scene to FBX. ' +
+            'Export fewer objects at once, or export GLB.' };
+    }
+
+    if (error.stderr) {
+        // assimp's own reason, without our temp paths
+        const line = error.stderr.split('\n').map((l) => l.trim())
+            .filter((l) => l && !/^Launching|^Info,|^Debug,/i.test(l)).pop() || '';
+        return { status: 422, text: `FBX conversion failed: ${line.replace(/\/\S*beestoon-editor-fbx-\S*/g, '').slice(0, 200) || 'the converter rejected this model'}` };
+    }
+
+    return { status: 500, text: 'FBX export failed on the server. Please try again, or export GLB.' };
+}
+
+
+/*
+ * assimp's binary FBX says UnitScaleFactor 1 (cm); the data
+ * is in metres. Both unit properties become 100 (m), in
+ * place (same 8-byte double): nothing else changes.
+ */
+export function fbxInMetres(fbx) {
+
+    if (fbx.subarray(0, 18).toString('latin1') !== 'Kaydara FBX Binary') {
+        return fbx;
+    }
+
+    for (const name of ['UnitScaleFactor', 'OriginalUnitScaleFactor']) {
+
+        const tag = Buffer.concat([Buffer.from('S'), Buffer.alloc(4), Buffer.from(name)]);
+        tag.writeUInt32LE(name.length, 1);
+
+        let at = fbx.indexOf(tag);
+
+        while (at !== -1) {
+
+            // "double", "Number", "" then the value
+            let i = at + tag.length;
+            let ok = true;
+
+            for (let k = 0; k < 3 && ok; k++) {
+                ok = fbx[i] === 0x53;   // 'S'
+                i += ok ? 5 + fbx.readUInt32LE(i + 1) : 0;
+            }
+
+            if (ok && fbx[i] === 0x44) {   // 'D'
+                fbx.writeDoubleLE(100, i + 1);
+            }
+
+            at = fbx.indexOf(tag, at + 1);
+        }
+    }
+
+    return fbx;
+}
+
+
+// Is assimp there (GET / reports it; checked once at start-up)
+let assimpState = 'unknown';
+
+export function fbxExportStatus() {
+    return assimpState;
+}
+
+function checkAssimp() {
+    const child = spawn(ASSIMP_BIN, ['version'], { stdio: 'ignore' });
+    child.on('error', () => { assimpState = 'missing'; console.warn('[export-fbx] assimp not found: FBX export is unavailable'); });
+    child.on('close', (code) => { if (assimpState === 'unknown') assimpState = code === 0 ? 'available' : 'broken'; });
+}
+
+
 function runAssimp(args, cwd) {
 
     return new Promise((resolve, reject) => {
@@ -331,9 +426,11 @@ function runAssimp(args, cwd) {
 
         // Kill the process itself on timeout, so a stuck
         // export cannot keep running in the background.
+        let timedOut = false;
         const timer = setTimeout(() => {
+            timedOut = true;
             child.kill('SIGKILL');
-            reject(new Error(`timed out after ${EXPORT_TIMEOUT_MS} ms`));
+            reject(Object.assign(new Error(`timed out after ${EXPORT_TIMEOUT_MS} ms`), { timedOut: true }));
         }, EXPORT_TIMEOUT_MS);
 
 
@@ -342,13 +439,18 @@ function runAssimp(args, cwd) {
             reject(error);
         });
 
-        child.on('close', (code) => {
+        child.on('close', (code, signal) => {
             clearTimeout(timer);
-
+            if (timedOut) {
+                return;
+            }
             if (code === 0) {
                 resolve();
+            } else if (signal) {
+                // Killed from outside (e.g. out of memory)
+                reject(Object.assign(new Error(`assimp killed by ${signal}: ${stderr.trim()}`), { signal }));
             } else {
-                reject(new Error(`assimp exited with ${code}: ${stderr.trim()}`));
+                reject(Object.assign(new Error(`assimp exited with ${code}: ${stderr.trim()}`), { stderr }));
             }
         });
     });

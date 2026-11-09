@@ -11,8 +11,9 @@ import { WebSocketTransport } from '@colyseus/ws-transport';
 import { ModelRoom } from './ModelRoom.mjs';
 import { getAuthAdapter, productionProblems } from './auth/index.mjs';
 import { registerConvertRoute } from './convert.mjs';
-import { registerExportFbxRoute } from './export-fbx.mjs';
+import { fbxExportStatus, registerExportFbxRoute } from './export-fbx.mjs';
 import { registerArShareRoutes } from './ar-share.mjs';
+import { installProxySafeMatchmaking } from './matchmake-errors.mjs';
 import { registerAssetRoutes } from './assets.mjs';
 import { registerMySessionsRoutes } from './my-sessions.mjs';
 import { registerCreditRoutes } from './credits.mjs';
@@ -71,6 +72,11 @@ if (allowedOrigins().length) {
 }
 
 
+// Join / create errors with statuses Render's proxy passes on
+// (matchmake-errors.mjs: 52x answers never reached the editor)
+installProxySafeMatchmaking(matchMaker.controller);
+
+
 const server = defineServer({
 
     rooms: {
@@ -108,7 +114,9 @@ const server = defineServer({
                 startedAt: STARTED_AT.toISOString(),
                 uptimeSeconds: Math.round((Date.now() - STARTED_AT.getTime()) / 1000),
                 commit: (process.env.RENDER_GIT_COMMIT || '').slice(0, 12) || null,
-                liveSessions: liveRooms().length
+                liveSessions: liveRooms().length,
+                // GLB -> FBX converter (assimp): available | missing | broken
+                fbxExport: fbxExportStatus()
             });
         });
 

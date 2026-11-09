@@ -258,11 +258,14 @@ async function main() {
     await waitFor(() => bob.got('action:denied', (d) => d.type === 'scene:save'), 'no name refused');
     check('a version needs a name', () => assert.match(last(bob, 'action:denied').reason, /name/));
 
+    // An editor's save waits for an admin's approval (save-approval.test.mjs)
     bob.send('scene:save', { name: 'First layout', description: 'Chair by the window' });
-    await waitFor(() => vic.got('scene:saved'), 'saved');
+    await waitFor(() => ada.got('save:request'), 'admin asked');
+    ada.send('save:approve', { requestId: last(ada, 'save:request').requestId });
+    await waitFor(() => vic.got('scene:saved', (d) => d.version.name === 'First layout'), 'saved');
 
-    check('an editor saves a named version and everyone hears about it', () => {
-        const { version } = last(vic, 'scene:saved');
+    check('an editor saves a named version (approved by an admin) and everyone hears about it', () => {
+        const { version } = vic.messages.find((m) => m.type === 'scene:saved' && m.payload.version.name === 'First layout').payload;
         assert.equal(version.name, 'First layout');
         assert.equal(version.description, 'Chair by the window');
         assert.equal(version.auto, false);

@@ -75,7 +75,11 @@
  *   same state and models. Leave in one browser only
  *   closes that browser (unless it closes the session).
  *
- *     'scene:save'        { name, description? }  (admins + editors)
+ *     'scene:save'        { name, description? }  (admins save; an editor's
+ *                         save is a request: save:status to them,
+ *                         save:request to admins)
+ *     'save:approve'      { requestId }  (admins; the first answer counts)
+ *     'save:decline'      { requestId }  (admins)
  *     'scene:versions'    {}  -> 'scene:versions' { versions }
  *
  *   Saved sessions (scene-versions.mjs): the first save
@@ -248,6 +252,12 @@ const IDLE_WARNING_MINUTES = Math.min(
 // Seconds between two saves by hand in one session
 const SAVE_COOLDOWN_SECONDS = 3;
 
+// A save asked for by a non-admin waits this long for an admin
+const SAVE_REQUEST_MINUTES = 10;
+
+const EMPTY_SAVE_REASON =
+    'Nothing to save yet: add a model first. An empty session is not kept as a saved session.';
+
 // Client-made ids (crypto.randomUUID or similar)
 const ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
 
@@ -312,18 +322,29 @@ export class ModelRoom extends Room {
 
         // A saved session behind this link? Then this
         // room re-opens it (only its owner may, onAuth).
+        // A storage failure is not "never saved": opening the link as a
+        // new, empty session would hide the saved scene, and the next
+        // save would point the link at a new one. Refuse (503: the
+        // editor retries and says why) until storage answers.
         let saved = null;
 
         try {
             saved = await sceneOfKey(sessionKey);
         } catch (error) {
-            console.error(`Could not read saved sessions: ${error.message}`);
+            console.error(`[${this.roomId}] could not read the saved session of ${sessionKey}: ${error.message}`);
+            throw new ServerError(503, 'The saved session could not be read from storage. Trying again…');
         }
 
         // Who belonged to this session before (owner, members,
         // removed people), also when it was never saved: a
         // server restart must not give it to whoever is back first
-        const record = await readRecord(sessionKey);
+        let record;
+
+        try {
+            record = await readRecord(sessionKey, { strict: true });
+        } catch {
+            throw new ServerError(503, 'The session\'s members could not be read from storage. Trying again…');
+        }
 
         if (record?.closedByAdmin && !saved) {
             console.log(`[${this.roomId}] refused to re-create ${sessionKey}: closed by an admin at ${record.closedByAdmin}`);
@@ -387,6 +408,12 @@ export class ModelRoom extends Room {
             this.poolHistory = [];
             this.refreshPool();
         }
+
+        // The initial pool chosen on the start screen: moved from the
+        // creator's balance into BeeStoon's pool when they are let in
+        // (admit), once (key "initial"), only for a session that is new
+        this.initialPool = this.poolBacked && !saved && !record ? poolFromOptions(options).total : 0;
+        this.initialPaid = false;
 
         // A session that existed before (saved, or recorded
         // before a server restart) was paid for when it started
@@ -476,7 +503,25 @@ export class ModelRoom extends Room {
 
         // A saved session starts from its newest version
         if (saved) {
-            await this.loadObjects(await latestVersion(saved));
+
+            let latest;
+
+            try {
+                latest = await latestVersion(saved);
+            } catch (error) {
+                unregisterSession(sessionKey, this);
+                console.error(`[${this.roomId}] could not read the newest version of ${sessionKey}: ${error.message}`);
+                throw new ServerError(503, 'The saved scene could not be read from storage. Trying again…');
+            }
+
+            await this.loadObjects(latest);
+
+            // Told to everyone who joins, like a missing model file
+            if (saved.versions?.length && !latest) {
+                console.warn(`[${this.roomId}] ${sessionKey}: its newest version file is missing; opening without its models`);
+                this.missingFiles.push({ name: saved.versions[saved.versions.length - 1].name || 'newest version',
+                    reason: 'the saved version file is no longer in storage; restore an earlier version from Versions' });
+            }
         }
 
 
@@ -666,7 +711,65 @@ export class ModelRoom extends Room {
 
         await this.chargeOnJoin(identity);
 
+        await this.payInitialPool(identity);
+
         return identity;
+    }
+
+
+    /*
+     * The creator of a new session chose an initial pool: it moves
+     * from their BeeStoon balance into the session pool before they
+     * are let in, exactly once (BeeStoon key pool:<session>:initial:
+     * a retried join, a reconnect or a second browser moves nothing
+     * again). Not enough credits: the session does not start (402,
+     * with the reason); BeeStoon unreachable: 503, the editor tries
+     * again. A separate deposit, recorded as the initial
+     * contribution, never mixed with a session-creation charge.
+     */
+    async payInitialPool(identity) {
+
+        if (!this.initialPool || this.initialPaid || this.hasCreator || this.owner) {
+            return;
+        }
+
+        try {
+            const answer = await beestoonPool.deposit(this.sessionKey, identity.userId, this.initialPool,
+                `pool:${this.sessionKey}:initial`, { initial: true });
+            this.initialPaid = true;
+            this.applyPool(answer);
+            identity.balance = answer.personalBalance ?? identity.balance;
+            console.log(`[${this.roomId}] initial pool of ${this.initialPool} credit(s) from ${shortId(identity.userId)}` +
+                (answer.replayed ? ' (already moved: nothing moved again)' : ''));
+        } catch (error) {
+            console.log(`[${this.roomId}] initial pool of ${this.initialPool} refused for ${shortId(identity.userId)}: ` +
+                `${error.code || ''} ${error.message}`);
+            if (error.code === 'insufficient_credits') {
+                throw new ServerError(402, `The session was not started: its initial pool of ${this.initialPool} ` +
+                    `credit${this.initialPool === 1 ? '' : 's'} could not be paid. ${error.userMessage || ''}`.trim());
+            }
+            throw new ServerError(503, 'The initial session pool could not be set up. Trying again…');
+        }
+    }
+
+
+    /*
+     * Paid work the pool cannot cover: the person who asked sees
+     * why (required / available when known) and what to do; an
+     * admin gets the Top up action, others are told to ask one.
+     */
+    poolShort(client, user, action, error) {
+
+        const isAdmin = user?.role === 'admin';
+
+        client.send('pool:short', {
+            action,
+            required: error?.required ?? null,
+            available: error?.available ?? null,
+            isAdmin,
+            text: (error?.userMessage || 'The session pool needs topping up.') +
+                (isAdmin ? '' : ' Ask a session admin to add credits to the pool.')
+        });
     }
 
 
@@ -1151,6 +1254,10 @@ export class ModelRoom extends Room {
 
             this.sendMissingFiles(client);
 
+            if (user.role === 'admin') {
+                this.sendSaveRequests(user);
+            }
+
         } else if (!wasOnline) {
 
             for (const admin of this.onlineUsers('admin')) {
@@ -1277,10 +1384,10 @@ export class ModelRoom extends Room {
         // which shut the owner out for 24 hours after any absence
         // longer than the reconnection window).
         if (user.role === 'admin' && user.status === 'approved' && this.onlineUsers('admin').length === 0) {
-
             if (!this.handOverAdmin(user)) {
                 console.log(`[${this.roomId}] last admin "${user.name}" left; the session stays open for its members`);
             }
+            this.checkSaveApprovers();
         }
 
 
@@ -1528,11 +1635,25 @@ export class ModelRoom extends Room {
 
             if (this.poolBacked) {
 
-                if (Date.now() - (user.creditsReadAt || 0) < 1000) {
+                // At most once a second per person; a request inside that
+                // second is answered once it is over (never dropped: it may
+                // follow an unlock the site just charged to the pool)
+                const wait = 1000 - (Date.now() - (user.creditsReadAt || 0));
+
+                if (wait > 0) {
+                    user.creditsTrailing = user.creditsTrailing || this.clock.setTimeout(() => {
+                        user.creditsTrailing = null;
+                        user.creditsReadAt = Date.now();
+                        this.refreshPool().then(() => this.sendMyPool(user));
+                    }, wait);
                     return;
                 }
 
                 user.creditsReadAt = Date.now();
+
+                // Paid work the site charged to the pool directly (an
+                // unlock): everyone's pool line is read again
+                await this.refreshPool();
 
                 return this.sendMyPool(user);
             }
@@ -1757,10 +1878,15 @@ export class ModelRoom extends Room {
                 try {
                     await this.payEntry(user);
                 } catch (error) {
+                    if (error.code === 'pool_insufficient') {
+                        this.poolShort(client, admin, 'join:approve', error);
+                        return this.actionDenied(client, 'join:approve',
+                            `${user.name}'s entry is paid by the session pool, which needs topping up`);
+                    }
                     return this.actionDenied(
                         client,
                         'join:approve',
-                        `${user.name} has no credits left to enter, and the credit pool does not cover entries`
+                        error.userMessage || `${user.name} has no credits left to enter, and the credit pool does not cover entries`
                     );
                 }
 
@@ -1857,8 +1983,25 @@ export class ModelRoom extends Room {
                 return this.actionDenied(client, 'session:upgrade', 'Not a valid credit pool amount');
             }
 
-            if (creditsEnabled()) {
-
+            if (creditsEnabled() && this.poolBacked) {
+                // The session pool pays the upgrade (once per step: the key
+                // names it); more pool credits are the admin's deposit
+                try {
+                    if (pool) {
+                        this.applyPool(await beestoonPool.deposit(this.sessionKey, admin.userId, pool,
+                            `pool:${this.sessionKey}:upgrade-${from}-${to}`));
+                    }
+                    this.applyPool(await beestoonPool.charge(this.sessionKey, {
+                        userId: admin.userId, amount: cost, key: this.chargeKey(`upgrade:${from}-${to}`),
+                        purpose: 'upgrade', reason: `Upgraded "${this.sessionName}" to ${SESSION_TYPES[to].label}`
+                    }));
+                } catch (error) {
+                    if (error.code === 'pool_insufficient') {
+                        this.poolShort(client, admin, 'session:upgrade', error);
+                    }
+                    return this.actionDenied(client, 'session:upgrade', error.userMessage || 'Could not take the credits');
+                }
+            } else if (creditsEnabled()) {
                 try {
                     admin.balance = await charge(
                         admin.userId,
@@ -1950,6 +2093,9 @@ export class ModelRoom extends Room {
                 this.sendState();
             } catch (error) {
                 user.generationCharges.delete(requestId);
+                if (error.code === 'pool_insufficient') {
+                    this.poolShort(client, user, 'generation:charge', error);
+                }
                 client.send('generation:denied', { requestId, reason: error.userMessage || 'Not enough credits' });
             }
         });
@@ -2761,6 +2907,16 @@ export class ModelRoom extends Room {
                 return this.actionDenied(client, 'scene:save', 'Give the version a name');
             }
 
+            // A deliberate rule, said as such (it used to answer "Saving failed")
+            if (!this.scene && this.objects.size === 0) {
+                return this.actionDenied(client, 'scene:save', EMPTY_SAVE_REASON);
+            }
+
+            // Not an admin: the save waits for an admin's approval
+            if (user.role !== 'admin') {
+                return this.requestSave(client, user, name, cleanText(data?.description, MAX_VERSION_DESCRIPTION));
+            }
+
             if (Date.now() - this.lastManualSave < SAVE_COOLDOWN_SECONDS * 1000) {
                 return this.actionDenied(client, 'scene:save', 'Saved a moment ago - try again in a few seconds');
             }
@@ -2778,6 +2934,10 @@ export class ModelRoom extends Room {
             }
         });
 
+
+        // A non-admin's save: an admin approves or declines it (once)
+        this.onAdmin('save:approve', (client, admin, data) => this.answerSave(client, admin, data?.requestId, true));
+        this.onAdmin('save:decline', (client, admin, data) => this.answerSave(client, admin, data?.requestId, false));
 
         // Version list: everyone who is in
         this.onApproved('scene:versions', (client) => {
@@ -2825,15 +2985,18 @@ export class ModelRoom extends Room {
      * for autosaves. Returns the version summary, or null
      * (reason in this.saveError).
      */
-    async save(version, byUser) {
+    async save(version, byUser, approved = null) {
 
         // Nothing to keep in a session that never had a model
-        if (!this.scene && this.objects.size === 0) {
+        // (scene:save says so before getting here: EMPTY_SAVE_REASON)
+        if (!this.scene && (approved ? approved.objects.length : this.objects.size) === 0) {
             this.dirty = false;
             return null;
         }
 
-        const changesAtStart = this.changeCount;
+        // An approved request saves the scene as it was when asked
+        // (approved.objects); later changes stay unsaved
+        const changesAtStart = approved ? approved.revision : this.changeCount;
 
         // Insertions whose object is in this save: confirmed after it
         const toConfirm = [...this.unconfirmed].filter(([, objectId]) => this.objects.has(objectId));
@@ -2864,7 +3027,7 @@ export class ModelRoom extends Room {
                     removed: [...this.banned],
                     baseUrl: this.baseUrl
                 },
-                [...this.objects.values()],
+                approved ? approved.objects : [...this.objects.values()],
                 {
                     ...version,
                     savedBy: byUser
@@ -2921,6 +3084,161 @@ export class ModelRoom extends Room {
 
             if (!this.closed) {
                 this.sendState();
+            }
+        }
+    }
+
+
+    /*
+     * Save Session by a non-admin: a request for one admin's yes.
+     * It names the scene as it is now (a copy of every object), and
+     * that copy is what gets saved: changes made while waiting are
+     * not approved with it. One open request per person (pressing
+     * Save again answers with the same one). Nobody can approve: said
+     * at once, nothing saved. Answers to the requester: save:status
+     * { requestId, status: pending | approved | declined | expired |
+     * no-admin | failed, text }. Admins: save:request, then
+     * save:resolved for everyone's popup.
+     */
+    requestSave(client, user, name, description) {
+
+        this.saveRequests = this.saveRequests || new Map();
+
+        const open = [...this.saveRequests.values()]
+            .find((r) => r.by.userId === user.userId && r.status === 'pending');
+
+        if (open) {
+            return client.send('save:status', { requestId: open.id, status: 'pending', text: 'Waiting for a session admin to approve your save' });
+        }
+
+        const admins = this.onlineUsers('admin');
+
+        if (!admins.length) {
+            console.log(`[${this.roomId}] save asked by ${user.name}: no admin online, not saved`);
+            return client.send('save:status', {
+                requestId: null,
+                status: 'no-admin',
+                text: 'No session admin is online to approve this save, so nothing was saved. Ask an admin to join, or try again later.'
+            });
+        }
+
+        const request = {
+            id: randomUUID(),
+            by: { userId: user.userId, name: user.name },
+            name,
+            description,
+            revision: this.changeCount,
+            objects: [...this.objects.values()].map((o) => structuredClone(o)),
+            createdAt: Date.now(),
+            status: 'pending'
+        };
+
+        request.timer = setTimeout(() => this.resolveSave(request, 'expired', null,
+            'No admin answered in time; nothing was saved. You can ask again.'), SAVE_REQUEST_MINUTES * 60000);
+
+        this.saveRequests.set(request.id, request);
+
+        console.log(`[${this.roomId}] ${user.name} asks to save "${name}" (request ${request.id.slice(0, 8)}, ${request.objects.length} objects)`);
+
+        for (const admin of admins) {
+            this.sendToUser(admin, 'save:request', this.saveRequestView(request));
+        }
+
+        this.sendToUser(user, 'save:status', { requestId: request.id, status: 'pending', text: 'Waiting for a session admin to approve your save' });
+    }
+
+
+    saveRequestView(request) {
+
+        return {
+            requestId: request.id,
+            by: request.by,
+            name: request.name,
+            objectCount: request.objects.length,
+            text: `${request.by.name} wants to save this session. Allow?`
+        };
+    }
+
+
+    // The first admin's answer counts; later ones (another admin, a
+    // double click, a resend after a reconnect) only hear the result
+    async answerSave(client, admin, requestId, approve) {
+
+        const request = this.saveRequests?.get(String(requestId || ''));
+
+        if (!request || request.status !== 'pending') {
+            return client.send('save:resolved', { requestId, status: request?.status || 'unknown' });
+        }
+
+        if (!approve) {
+            return this.resolveSave(request, 'declined', admin, `${admin.name} declined your save; nothing was saved.`);
+        }
+
+        request.status = 'saving';
+        clearTimeout(request.timer);
+
+        const version = await this.save({ name: request.name, description: request.description, auto: false },
+            { userId: request.by.userId, name: request.by.name }, request);
+
+        console.log(`[${this.roomId}] ${admin.name} approved the save of ${request.by.name} (request ${request.id.slice(0, 8)}): ` +
+            `${version ? 'saved' : 'failed'}`);
+
+        this.resolveSave(request, version ? 'approved' : 'failed', admin, version
+            ? `${admin.name} approved your save: "${request.name}" is saved.`
+            : `${admin.name} approved your save, but saving failed: ${this.saveError || 'please try again'}.`);
+    }
+
+
+    resolveSave(request, status, admin, text) {
+
+        if (request.status !== 'pending' && request.status !== 'saving') {
+            return;
+        }
+
+        request.status = status;
+        clearTimeout(request.timer);
+        request.objects = null;
+
+        const requester = this.users.get(request.by.userId);
+
+        if (requester) {
+            this.sendToUser(requester, 'save:status', { requestId: request.id, status, text });
+        }
+
+        for (const user of this.onlineUsers('admin')) {
+            this.sendToUser(user, 'save:resolved', { requestId: request.id, status, by: admin?.name || null });
+        }
+
+        // Kept a while for late answers ("already approved"), then dropped
+        setTimeout(() => this.saveRequests?.delete(request.id), 10 * 60000).unref?.();
+    }
+
+
+    // An admin arrives (or becomes admin): the requests still open
+    sendSaveRequests(user) {
+
+        for (const request of this.saveRequests?.values() || []) {
+            if (request.status === 'pending') {
+                this.sendToUser(user, 'save:request', this.saveRequestView(request));
+            }
+        }
+    }
+
+
+    // The last admin left and nobody took over: say so, save nothing
+    checkSaveApprovers() {
+
+        if (this.onlineUsers('admin').length) {
+            for (const admin of this.onlineUsers('admin')) {
+                this.sendSaveRequests(admin);
+            }
+            return;
+        }
+
+        for (const request of this.saveRequests?.values() || []) {
+            if (request.status === 'pending') {
+                this.resolveSave(request, 'no-admin', null,
+                    'The session admin left before answering; nothing was saved. Ask again when an admin is here.');
             }
         }
     }
@@ -3332,6 +3650,8 @@ export class ModelRoom extends Room {
                 credits: (creditsEnabled() && paidFeatureEnabled('pool')) || !!this.poolBacked,
                 // credits:withdraw (admins; the pool kept by BeeStoon)
                 poolWithdraw: !!this.poolBacked,
+                // A non-admin's Save is a request an admin approves (save:request)
+                saveApproval: true,
                 // session:upgrade (admins)
                 sessionUpgrade: paidFeatureEnabled('upgrade'),
                 // object:material (material/texture sync)
