@@ -193,10 +193,24 @@ async function main() {
 
     console.log('\nThe pool panel is there with prices off (EDITOR_POOL=on)');
     const ada = await connect('Ada', KEY, 'create');
+    // Seeded directly in the fake (not a deposit: Ada's own balance must
+    // stay untouched by someone else's entry), just enough to cover one
+    // entry so the charge below lands the pool back at exactly 0 -
+    // keeping every absolute balance below unaffected.
+    poolOf(KEY).balance = 1;
     const bob = await connect('Bob', KEY);
+    const chargesBefore = calls.filter((c) => c.path.endsWith('/charge')).length;
     ada.send('join:approve', { userId: bob.state.you.userId, role: 'editor' });
     await waitFor(() => bob.state.you.status === 'approved', 'bob approved');
     await waitFor(() => ada.state.credits?.balance === 20, 'ada balance');
+    check('approving a pending join charges the session pool once for the entry (not Ada\'s balance)', () => {
+        const entryCharges = calls.filter((c) => c.path.endsWith('/charge')).slice(chargesBefore)
+            .filter((c) => c.body.purpose === 'entry');
+        assert.equal(entryCharges.length, 1);
+        assert.equal(entryCharges[0].body.userId, bob.state.you.userId);
+        assert.equal(entryCharges[0].body.amount, 1);
+        assert.equal(poolOf(KEY).balance, 0);
+    });
     check('credits state and features for everyone, withdrawals offered', () => {
         assert.equal(ada.state.features.credits, true);
         assert.equal(ada.state.features.poolWithdraw, true);
@@ -252,7 +266,7 @@ async function main() {
     check('the admin gets what they may take back and the history', () => {
         const mine = ada.got('credits:mine').payload;
         assert.equal(mine.mine.withdrawable, 2);
-        assert.equal(mine.history.length, 2);
+        assert.equal(mine.history.length, 3);                       // entry charge, deposit, withdraw
     });
 
     console.log('\nThe pool charged from outside (an Unlock on the site) is read again');
@@ -314,6 +328,19 @@ async function main() {
         assert.equal(answer.status, 402);
     });
     await ada3.room.leave();
+
+    console.log('\nAn empty pool blocks approval instead of letting the entry through free');
+    const emptyKey = 'poolentryempty01';
+    const gina = await connect('Gina', emptyKey, 'create');                   // pool stays at 0, nobody deposited
+    const hank = await connect('Hank', emptyKey);
+    gina.send('join:approve', { userId: hank.state.you.userId, role: 'editor' });
+    await waitFor(() => gina.got('pool:short', (d) => d.action === 'join:approve'), 'gina sees pool:short');
+    check('hank is not let in, and the pool is told to top up rather than waived', () => {
+        assert.equal(hank.state.you.status, 'pending');
+        assert.equal(poolOf(emptyKey).balance, 0);
+    });
+    await gina.room.leave();
+    await hank.room.leave();
 
     console.log(`\nAll ${passed} checks passed`);
 }
