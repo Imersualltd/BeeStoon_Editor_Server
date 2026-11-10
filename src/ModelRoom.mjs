@@ -779,15 +779,17 @@ export class ModelRoom extends Room {
      */
     async chargeOnJoin(identity) {
 
-        if (!creditsEnabled()) {
-            return;
-        }
-
         const { userId, name, email } = identity;
 
-        // The creator of a new session pays its type
-        // and the pool
+        // The creator of a new session pays its type and the pool: this
+        // personal charge is unrelated to the per-member entry charge
+        // below, and stays off while CREDITS_ENABLED=false (the pilot's
+        // kill switch), pool-backed session or not.
         if (!this.hasCreator && !this.creatorCharged) {
+
+            if (!creditsEnabled()) {
+                return;
+            }
 
             if (!paidFeatureEnabled('sessions')) {
                 throw new ServerError(403, paidFeatureMessage('sessions'));
@@ -820,6 +822,13 @@ export class ModelRoom extends Room {
             return;
         }
 
+        // Entry payment for everyone else: the pool pays this
+        // independently of CREDITS_ENABLED when it is backing this
+        // session (see editor_pool.py and credits.mjs beestoonPoolEnabled).
+        if (!creditsEnabled() && !this.poolBacked) {
+            return;
+        }
+
         identity.balance = await balanceOf(userId);
 
         // Here before, a second browser, or the owner
@@ -845,9 +854,10 @@ export class ModelRoom extends Room {
             return;
         }
 
-        // Waits for an admin: pays when let in, but say
-        // now if that cannot work
-        if (!this.poolPaysEntry() && identity.balance < ENTRY_COST) {
+        // Waits for an admin: pays when let in, but say now if that cannot
+        // work. Pool-backed: the real check happens against the pool at
+        // join:approve time (payEntry), not against this person's balance.
+        if (!this.poolBacked && !this.poolPaysEntry() && identity.balance < ENTRY_COST) {
             throw new ServerError(
                 402,
                 `You need ${ENTRY_COST} credit to join this session (you have ${identity.balance}).`
@@ -1873,7 +1883,7 @@ export class ModelRoom extends Room {
             }
 
 
-            if (creditsEnabled() && !this.entryPaid.has(user.userId)) {
+            if ((creditsEnabled() || this.poolBacked) && !this.entryPaid.has(user.userId)) {
 
                 try {
                     await this.payEntry(user);
