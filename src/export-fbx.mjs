@@ -56,9 +56,12 @@ import { requireEditor } from './sessions.mjs';
 
 
 // Keep in sync with MAX_FBX_EXPORT_SIZE in model-converter.mjs
-const MAX_UPLOAD_BYTES = 50 * 1024 * 1024;
+const MAX_UPLOAD_BYTES = 500 * 1024 * 1024;
 
-const EXPORT_TIMEOUT_MS = 90 * 1000;
+// assimp needs real time on a big mesh; kept under Node's own default
+// request-receive ceiling (300 s) so a slow transfer fails with a clear
+// message here, not a bare connection drop further down.
+const EXPORT_TIMEOUT_MS = 240 * 1000;
 
 const ASSIMP_BIN = process.env.ASSIMP_BIN || 'assimp';
 
@@ -110,7 +113,7 @@ export function registerExportFbxRoute(app) {
     app.use('/export/fbx', (error, req, res, next) => {
 
         if (error?.type === 'entity.too.large') {
-            res.status(413).send('Model is too big for FBX export (max 50 MB)');
+            res.status(413).send('Model is too big for FBX export (max 500 MB)');
             return;
         }
 
