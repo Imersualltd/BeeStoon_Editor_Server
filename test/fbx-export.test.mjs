@@ -69,7 +69,7 @@ check('converter missing', () => assert.match(exportError({ code: 'ENOENT' }).te
 check('too slow for the server (stopped at the limit)', () => {
     const e = exportError({ timedOut: true });
     assert.equal(e.status, 503);
-    assert.match(e.text, /took longer than 90 s.*Export fewer objects/);
+    assert.match(e.text, /took longer than 240 s.*Export fewer objects/);
 });
 check('killed from outside (out of memory)', () => assert.match(exportError({ signal: 'SIGKILL' }).text, /ran out of resources/));
 check('assimp\'s own reason, without temp paths', () => {
