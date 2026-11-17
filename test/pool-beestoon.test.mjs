@@ -53,7 +53,7 @@ const calls = [];
 
 function poolOf(key) {
     if (!pools.has(key)) {
-        pools.set(key, { balance: 0, deposited: 0, withdrawn: 0, spent: 0, reserved: 0, forEntry: false, forModels: false, mine: new Map(), history: [] });
+        pools.set(key, { balance: 0, deposited: 0, withdrawn: 0, spent: 0, reserved: 0, forEntry: true, forModels: true, mine: new Map(), history: [] });
     }
     return pools.get(key);
 }
@@ -102,7 +102,18 @@ const fake = createServer((req, res) => {
         if (seen.has(json.key)) {
             return send(200, { ...stateOf(sessionKey, json.userId), replayed: true });
         }
-        if (action === 'charge') {                    // pool only, as BeeStoon
+        if (action === 'charge') {                    // as BeeStoon (editor_pool.py charge_work)
+            const memberPays = (json.purpose === 'entry' && !p.forEntry) || (json.purpose === 'models' && !p.forModels);
+            if (memberPays) {
+                const own = balances.get(json.userId) ?? 20;
+                if (own < json.amount) {
+                    return send(402, { detail: { error: `This session's pool does not pay for this: it costs ${json.amount} credit of your own, and you have ${own}.`,
+                        code: 'member_insufficient', required: json.amount, balance: own } });
+                }
+                balances.set(json.userId, own - json.amount);
+                seen.set(json.key, true);
+                return send(200, { paidBy: 'self', replayed: false, ...stateOf(sessionKey) });
+            }
             if (p.balance - p.reserved < json.amount) {
                 return send(402, { detail: { error: `The session pool needs topping up: this costs ${json.amount}, the pool has ${p.balance - p.reserved} available.`,
                     code: 'pool_insufficient', required: json.amount, available: p.balance - p.reserved } });
@@ -341,6 +352,59 @@ async function main() {
     });
     await gina.room.leave();
     await hank.room.leave();
+
+    console.log('\nThe "Pay for ..." choices of the start screen decide who pays');
+    const choiceKey = 'paychoice0001';
+    const choiceMark = calls.length;
+    const ivy = await connect('Ivy', choiceKey, 'create', { sessionType: 'basic', creditPool: 0, poolForEntry: false, poolForModels: true });
+    await waitFor(() => calls.slice(choiceMark).some((c) => c.path.endsWith(`/${choiceKey}/settings`)), 'choices sent');
+    check('the creator\'s choices reach BeeStoon\'s pool, as they were ticked', () => {
+        const sent = calls.slice(choiceMark).filter((c) => c.path.endsWith(`/${choiceKey}/settings`));
+        assert.equal(sent.length, 1);
+        assert.deepEqual(sent[0].body, { forEntry: false, forModels: true });
+        assert.equal(poolOf(choiceKey).forEntry, false);
+    });
+    const jack = await connect('Jack', choiceKey);
+    const jackId = jack.state.you.userId;
+    balances.set(jackId, 5);
+    ivy.send('join:approve', { userId: jackId, role: 'editor' });
+    await waitFor(() => jack.state.you.status === 'approved', 'jack let in');
+    check('"Pay for members joining" off: the member pays the entry from their own credits, the pool nothing', () => {
+        assert.equal(balances.get(jackId), 4);
+        assert.equal(poolOf(choiceKey).balance, 0);
+        assert.equal(poolOf(choiceKey).spent, 0);
+    });
+    await jack.room.leave();
+    await ivy.room.leave();
+
+    const poorChoice = 'paychoice0002';
+    const kim = await connect('Kim', poorChoice, 'create', { sessionType: 'basic', poolForEntry: false, poolForModels: false });
+    await waitFor(() => poolOf(poorChoice).forEntry === false, 'choices of the second session');
+    const lou = await connect('Lou', poorChoice);
+    balances.set(lou.state.you.userId, 0);
+    kim.send('join:approve', { userId: lou.state.you.userId, role: 'editor' });
+    await waitFor(() => kim.got('action:denied', (d) => d.type === 'join:approve'), 'kim told');
+    check('a member who cannot pay their own entry is not let in, with the reason, and is not charged', () => {
+        assert.equal(lou.state.you.status, 'pending');
+        assert.match(kim.messages.filter((m) => m.type === 'action:denied').pop().payload.reason, /own/);
+        assert.equal(balances.get(lou.state.you.userId), 0);
+    });
+    await lou.room.leave();
+    await kim.room.leave();
+
+    const soloKey = 'paychoice0003';
+    const oldKey = 'paychoice0004';
+    const mark = calls.length;
+    const solo = await connect('Max', soloKey, 'create', { sessionType: 'single', poolForEntry: false, poolForModels: false });
+    const old = await connect('Ned', oldKey, 'create', { sessionType: 'basic' });     // an older client: no choices sent
+    await sleep(300);
+    check('a single session, or an older client that sends no choices, leaves BeeStoon\'s default (the pool pays)', () => {
+        assert.ok(!calls.slice(mark).some((c) => c.path.endsWith('/settings')));
+        assert.equal(poolOf(soloKey).forModels, true);
+        assert.equal(poolOf(oldKey).forEntry, true);
+    });
+    await solo.room.leave();
+    await old.room.leave();
 
     console.log(`\nAll ${passed} checks passed`);
 }
