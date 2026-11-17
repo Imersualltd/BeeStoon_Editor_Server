@@ -28,6 +28,8 @@
  *                         older clients send { dataUrl } instead,
  *                         which is still kept in memory)
  *     'object:transform'  { id, position, rotation, scale }
+ *     'object:rename'     { id, name }   display name only (1-200
+ *                         chars); same edit rights as a transform
  *     'object:remove'     { id }
  *     'object:hold'       { id }
  *     'object:release'    { id }
@@ -131,8 +133,10 @@
  *     'object:transform'  { id, position, rotation, scale }
  *     'object:remove'     { id }
  *     'object:rejected'   { id, reason }   (room memory full)
- *     'object:denied'     { id, reason, transform? }  (no permission;
- *                         transform = the pose to snap back to)
+ *     'object:rename'     { id, name }
+ *     'object:denied'     { id, reason, transform?, name? }  (no
+ *                         permission; transform = the pose, name =
+ *                         the name to snap back to)
  *     'action:denied'     { type, reason }   (admin action refused)
  *     'session:upgraded'  { from, to, by, cost, pool }
  *     'scene:saved'       { version }   (version summary)
@@ -1725,6 +1729,51 @@ export class ModelRoom extends Room {
                 { id: object.id, ...object.transform },
                 client
             );
+        });
+
+
+        // Display name only: the object's id, asset and the original model
+        // file are untouched. Same edit rights and holds as a transform; a
+        // refusal sends the current name back so the sender snaps back to it.
+        this.onApproved('object:rename', (client, user, data) => {
+
+            const name = typeof data?.name === 'string' ? data.name.trim() : '';
+
+            if (!isValidId(data?.id) || !name || name.length > 200) {
+                return;
+            }
+
+
+            const object = this.objects.get(data.id);
+
+            if (!object) {
+                return;
+            }
+
+
+            const reason = this.editDenial(user, object);
+
+            if (reason) {
+
+                this.deny(client, object.id, reason, object, { name: object.name });
+
+                return;
+            }
+
+
+            if (object.name === name) {
+                return;
+            }
+
+
+            object.name = name;
+
+            this.markDirty();
+
+            this.sendApproved('object:rename', { id: object.id, name }, client);
+
+            // session:state's object list (the Objects panel) shows names too
+            this.sendState();
         });
 
 
@@ -3749,9 +3798,9 @@ export class ModelRoom extends Room {
     }
 
 
-    deny(client, id, reason, object) {
+    deny(client, id, reason, object, extra = null) {
 
-        const message = { id, reason };
+        const message = { id, reason, ...(extra || {}) };
 
         if (object?.transform) {
             message.transform = object.transform;
