@@ -28,6 +28,8 @@
  *                         older clients send { dataUrl } instead,
  *                         which is still kept in memory)
  *     'object:transform'  { id, position, rotation, scale }
+ *     'object:rename'     { id, name }   display name only (1-200
+ *                         chars); same edit rights as a transform
  *     'object:remove'     { id }
  *     'object:hold'       { id }
  *     'object:release'    { id }
@@ -131,8 +133,10 @@
  *     'object:transform'  { id, position, rotation, scale }
  *     'object:remove'     { id }
  *     'object:rejected'   { id, reason }   (room memory full)
- *     'object:denied'     { id, reason, transform? }  (no permission;
- *                         transform = the pose to snap back to)
+ *     'object:rename'     { id, name }
+ *     'object:denied'     { id, reason, transform?, name? }  (no
+ *                         permission; transform = the pose, name =
+ *                         the name to snap back to)
  *     'action:denied'     { type, reason }   (admin action refused)
  *     'session:upgraded'  { from, to, by, cost, pool }
  *     'scene:saved'       { version }   (version summary)
@@ -414,6 +418,20 @@ export class ModelRoom extends Room {
         // (admit), once (key "initial"), only for a session that is new
         this.initialPool = this.poolBacked && !saved && !record ? poolFromOptions(options).total : 0;
         this.initialPaid = false;
+
+        // The "Pay for ..." choices made on the start screen, for BeeStoon's
+        // pool (it decides who pays, see editor_pool.py charge_work). Only a
+        // new multi-person session, and only choices the client actually
+        // sent: an older client, or a single session (no such choices on its
+        // start screen), leaves BeeStoon's default (the pool pays).
+        this.initialChoices = null;
+
+        if (this.poolBacked && !saved && !record && this.sessionType !== 'single') {
+            const choices = {};
+            if (typeof options?.poolForEntry === 'boolean') choices.forEntry = options.poolForEntry;
+            if (typeof options?.poolForModels === 'boolean') choices.forModels = options.poolForModels;
+            this.initialChoices = Object.keys(choices).length ? choices : null;
+        }
 
         // A session that existed before (saved, or recorded
         // before a server restart) was paid for when it started
@@ -713,6 +731,8 @@ export class ModelRoom extends Room {
 
         await this.payInitialPool(identity);
 
+        await this.applyInitialChoices(identity);
+
         return identity;
     }
 
@@ -749,6 +769,30 @@ export class ModelRoom extends Room {
                     `credit${this.initialPool === 1 ? '' : 's'} could not be paid. ${error.userMessage || ''}`.trim());
             }
             throw new ServerError(503, 'The initial session pool could not be set up. Trying again…');
+        }
+    }
+
+
+    /*
+     * Sends the start screen's "Pay for ..." choices to BeeStoon's pool, once,
+     * when the creator first comes in (same moment as the initial pool).
+     * Setting the same choices again is harmless, so a retry after a failed
+     * attempt is fine; until it succeeds BeeStoon keeps its default (the
+     * pool pays), never charging anyone twice either way.
+     */
+    async applyInitialChoices(identity) {
+
+        if (!this.initialChoices || this.hasCreator || this.owner) {
+            return;
+        }
+
+        try {
+            this.applyPool(await beestoonPool.settings(this.sessionKey, this.initialChoices));
+            console.log(`[${this.roomId}] pool pays for: ${JSON.stringify(this.initialChoices)} (chosen by ${shortId(identity.userId)})`);
+            this.initialChoices = null;
+        } catch (error) {
+            console.log(`[${this.roomId}] pool choices not saved yet: ${error.code || ''} ${error.message}`);
+            throw new ServerError(503, 'The session pool could not be set up. Trying again…');
         }
     }
 
@@ -1725,6 +1769,51 @@ export class ModelRoom extends Room {
                 { id: object.id, ...object.transform },
                 client
             );
+        });
+
+
+        // Display name only: the object's id, asset and the original model
+        // file are untouched. Same edit rights and holds as a transform; a
+        // refusal sends the current name back so the sender snaps back to it.
+        this.onApproved('object:rename', (client, user, data) => {
+
+            const name = typeof data?.name === 'string' ? data.name.trim() : '';
+
+            if (!isValidId(data?.id) || !name || name.length > 200) {
+                return;
+            }
+
+
+            const object = this.objects.get(data.id);
+
+            if (!object) {
+                return;
+            }
+
+
+            const reason = this.editDenial(user, object);
+
+            if (reason) {
+
+                this.deny(client, object.id, reason, object, { name: object.name });
+
+                return;
+            }
+
+
+            if (object.name === name) {
+                return;
+            }
+
+
+            object.name = name;
+
+            this.markDirty();
+
+            this.sendApproved('object:rename', { id: object.id, name }, client);
+
+            // session:state's object list (the Objects panel) shows names too
+            this.sendState();
         });
 
 
@@ -3749,9 +3838,9 @@ export class ModelRoom extends Room {
     }
 
 
-    deny(client, id, reason, object) {
+    deny(client, id, reason, object, extra = null) {
 
-        const message = { id, reason };
+        const message = { id, reason, ...(extra || {}) };
 
         if (object?.transform) {
             message.transform = object.transform;
