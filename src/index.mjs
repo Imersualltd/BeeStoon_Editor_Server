@@ -6,6 +6,7 @@
  * through the PORT environment variable.
  */
 
+import * as Sentry from '@sentry/node';
 import { defineServer, defineRoom, matchMaker } from 'colyseus';
 import { WebSocketTransport } from '@colyseus/ws-transport';
 import { ModelRoom } from './ModelRoom.mjs';
@@ -142,6 +143,10 @@ const server = defineServer({
 
         // GET /internal/sessions/<key>/members/<userId> : for the BeeStoon backend (see internal.mjs)
         registerInternalRoutes(app);
+
+        // Last: errors no route answered go to Sentry (instrument.mjs;
+        // does nothing without SENTRY_DSN), then on to Express as before
+        Sentry.setupExpressErrorHandler(app);
     }
 });
 
