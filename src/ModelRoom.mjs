@@ -182,6 +182,8 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { Room, ServerError } from 'colyseus';
 
+import { flushAnalyticsWithin, sessionRef, track } from './analytics.mjs';
+
 import { getAuthAdapter } from './auth/index.mjs';
 import { ACCESS_REMOVED_CODE, AccessError, requireAccess } from './editor-access.mjs';
 import { arSharingEnabled, revokeSessionLinks } from './ar-share.mjs';
@@ -266,6 +268,21 @@ const EMPTY_SAVE_REASON =
 const ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
 
 const ROLES = ['admin', 'editor', 'viewer'];
+
+// Analytics (analytics.mjs) -------------------------------------
+// What made a model, as the editor tags it on object:add
+const CLIENT_ORIGINS = [
+    'device', 'shape', 'light', 'light_edit', 'environment',
+    'knife', 'separate', 'sculpt', 'combine', 'magic', 'duplicate', 'undo'
+];
+// What BeeStoon says a beestoon:insert came from (insertion reserve)
+const IMPORT_ORIGINS = ['my_3d_library', 'beestoon_ai', 'my_library'];
+const EXPORT_FORMATS = ['glb', 'usdz', 'fbx', 'zip'];
+const EXPORT_SCOPES = ['selected', 'all', 'scene'];
+// Messages of one gesture (a drag, a slider) count as one tool use
+const EDIT_GESTURE_MS = 3000;
+// analytics:usage messages per person per minute
+const USAGE_PER_MINUTE = 60;
 
 // An account in the logs, without printing the whole id
 function shortId(userId) {
@@ -369,6 +386,17 @@ export class ModelRoom extends Room {
 
         this.sessionKey = sessionKey;
 
+        // Analytics (analytics.mjs): how this room started, who was
+        // here, and per-object debounce of repeated edits
+        this.analytics = {
+            kind: saved ? 'reopened' : record ? 'restored' : 'new',
+            startedAt: Date.now(),
+            started: false,
+            people: new Set(),
+            peak: 0,
+            edits: new Map()
+        };
+
         // Saved session record (scene-versions.mjs), null
         // until the session is saved for the first time
         this.scene = saved;
@@ -432,6 +460,8 @@ export class ModelRoom extends Room {
             if (typeof options?.poolForModels === 'boolean') choices.forModels = options.poolForModels;
             this.initialChoices = Object.keys(choices).length ? choices : null;
         }
+
+        this.analytics.choices = this.initialChoices ? { ...this.initialChoices } : null;
 
         // A session that existed before (saved, or recorded
         // before a server restart) was paid for when it started
@@ -1273,11 +1303,20 @@ export class ModelRoom extends Room {
 
             this.users.set(userId, user);
 
+            this.trackJoin(user, user.status !== 'approved'
+                ? null
+                : userId === this.owner?.userId ? 'owner' : this.known.has(userId) ? 'returning' : 'invite');
+
         } else {
 
             // Returning approved users keep their role
             user.name = name;
             user.email = email || user.email;
+
+            // Back after leaving (not a second browser): a new stay
+            if (user.analyticsSince == null && user.status === 'approved') {
+                this.trackJoin(user, 'returning');
+            }
         }
 
 
@@ -1391,6 +1430,8 @@ export class ModelRoom extends Room {
         user.clients.delete(client);
         user.dropped.delete(client);
 
+        this.endVr(client, user);
+
         this.refreshOnline(user);
 
 
@@ -1419,7 +1460,9 @@ export class ModelRoom extends Room {
 
     // Someone has no browser left in the session (left,
     // tab closed and not back in time, or inactive)
-    afterUserGone(user) {
+    afterUserGone(user, reason = 'left') {
+
+        this.trackLeft(user, reason);
 
         // Pending people who give up are forgotten
         if (user.status === 'pending') {
@@ -1469,6 +1512,8 @@ export class ModelRoom extends Room {
 
         this.fixLocks();
 
+        track('editor_role_changed', { session: this.sessionKey, user: next.userId, from: 'editor', to: 'admin', auto: true });
+
         console.log(`[${this.roomId}] admin passed to "${next.name}" (oldest editor)`);
 
         this.sendApproved('session:notice', {
@@ -1502,6 +1547,22 @@ export class ModelRoom extends Room {
         if (this.dirty) {
             await this.save({ auto: true, name: 'Session end' }, null);
         }
+
+        if (this.analytics.started) {
+            track('editor_session_ended', {
+                session: this.sessionKey,
+                user: this.owner?.userId,
+                duration_s: Math.round((Date.now() - this.analytics.startedAt) / 1000),
+                objects: this.objects.size,
+                bytes: this.usedBytes(),
+                people_total: this.analytics.people.size,
+                people_peak: this.analytics.peak,
+                closed: !!this.closedByAdmin
+            });
+        }
+
+        // Shutting down (a deploy): what is queued goes out first
+        await flushAnalyticsWithin(3000);
 
         console.log(`[${this.roomId}] session ${this.sessionKey} ended`);
     }
@@ -1570,6 +1631,9 @@ export class ModelRoom extends Room {
 
             if (used > this.limits.maxBytes) {
 
+                track('editor_model_rejected', { session: this.sessionKey, user: user.userId, reason: 'session_full',
+                    session_type: this.sessionType });
+
                 client.send('object:rejected', {
                     id: data.id,
                     reason: `The session is full (${mb(this.limits.maxBytes)} MB of models for a ${this.limits.label} session) - this model stays only on your screen`
@@ -1582,6 +1646,9 @@ export class ModelRoom extends Room {
             if (this.totalBytes - freed + added > MAX_ROOM_BYTES) {
 
                 console.warn(`[${this.roomId}] room is full, rejected "${data.name}"`);
+
+                track('editor_model_rejected', { session: this.sessionKey, user: user.userId, reason: 'memory',
+                    session_type: this.sessionType });
 
                 client.send('object:rejected', {
                     id: data.id,
@@ -1613,6 +1680,15 @@ export class ModelRoom extends Room {
             this.totalBytes += added - freed;
 
             this.markDirty();
+
+            // The same file again under the same id is a resend (a
+            // reconnect, a server restart), not a new model
+            if (!previous || previous.assetId !== object.assetId || (!isFile && previous.dataUrl !== object.dataUrl)) {
+                this.trackModelAdded(client, user, object, cleanOrigin(data.origin), {
+                    replaced: !!previous,
+                    bytes: isFile ? object.size : dataUrlBytes(object.dataUrl)
+                });
+            }
 
 
             console.log(
@@ -1675,6 +1751,9 @@ export class ModelRoom extends Room {
             object.materials = materials;
 
             this.markDirty();
+
+            this.countVr(client, 'materials');
+            this.trackEdit(client, user, object, 'material');
 
             this.sendApproved('object:materials', { id: object.id, materials }, client);
 
@@ -1760,9 +1839,20 @@ export class ModelRoom extends Room {
             }
 
 
+            const before = object.transform;
+
             object.transform = pickTransform(data);
 
             this.markDirty();
+
+            // Scale tool: any change of size (gizmo, inspector or VR),
+            // one use per gesture (edits of one object within a few seconds)
+            this.countVr(client, 'moves');
+
+            if (scaleChanged(before, object.transform)) {
+                this.countVr(client, 'scales');
+                this.trackEdit(client, user, object, 'scale');
+            }
 
             this.sendApproved(
                 'object:transform',
@@ -1810,6 +1900,8 @@ export class ModelRoom extends Room {
 
             this.markDirty();
 
+            this.countVr(client, 'renames');
+
             this.sendApproved('object:rename', { id: object.id, name }, client);
 
             // session:state's object list (the Objects panel) shows names too
@@ -1843,6 +1935,11 @@ export class ModelRoom extends Room {
             }
 
             this.markDirty();
+
+            this.countVr(client, 'removes');
+
+            track('editor_model_removed', { session: this.sessionKey, user: user.userId, object: object.id,
+                vr: this.inVr(client) || undefined });
 
 
             console.log(
@@ -2000,11 +2097,18 @@ export class ModelRoom extends Room {
             user.role = data.role;
             user.ticket = issueTicket(this, user.userId);
 
+            const wasRemoved = !!user.removedBefore;
+
             // Let in again after a removal: no longer removed
             if (this.banned.delete(user.userId)) {
                 user.removedBefore = false;
                 this.markDirty();
             }
+
+            this.trackJoin(user, 'approved', {
+                by: admin.userId, wait_s: Math.round((Date.now() - user.joinedAt) / 1000),
+                removed_before: wasRemoved || undefined
+            });
 
 
             console.log(`[${this.roomId}] ${admin.name} approved "${user.name}" as ${user.role}`);
@@ -2143,6 +2247,11 @@ export class ModelRoom extends Room {
 
             console.log(`[${this.roomId}] ${admin.name} upgraded ${from} -> ${this.sessionType} (cost ${cost}, pool +${pool})`);
 
+            track('editor_session_upgraded', {
+                session: this.sessionKey, user: admin.userId, from, to: this.sessionType,
+                cost: creditsEnabled() ? cost : 0, pool_added: creditsEnabled() ? pool : 0
+            });
+
             this.sendApproved('session:upgraded', {
                 from,
                 to: this.sessionType,
@@ -2264,6 +2373,10 @@ export class ModelRoom extends Room {
 
             console.log(`[${this.roomId}] ${admin.name} denied "${user.name}"`);
 
+            track('editor_join_denied', {
+                session: this.sessionKey, user: user.userId, by: admin.userId,
+                wait_s: Math.round((Date.now() - user.joinedAt) / 1000), removed_before: !!user.removedBefore || undefined
+            });
 
             this.users.delete(user.userId);
 
@@ -2306,9 +2419,15 @@ export class ModelRoom extends Room {
             }
 
 
+            const fromRole = user.role;
+
             user.role = data.role;
 
             this.fixLocks();
+
+            if (fromRole !== user.role) {
+                track('editor_role_changed', { session: this.sessionKey, user: user.userId, from: fromRole, to: user.role, by: admin.userId });
+            }
 
 
             console.log(`[${this.roomId}] ${admin.name} made "${user.name}" ${user.role}`);
@@ -2401,6 +2520,12 @@ export class ModelRoom extends Room {
 
             console.log(`[${this.roomId}] ${admin.name} kicked "${user.name}"`);
 
+            track('editor_member_removed', {
+                session: this.sessionKey, user: user.userId, by: admin.userId,
+                role: user.status === 'approved' ? user.role : 'pending'
+            });
+
+            user.analyticsSince = null;
 
             this.banned.add(user.userId);
 
@@ -2456,6 +2581,8 @@ export class ModelRoom extends Room {
             }
 
             console.log(`[${this.roomId}] ${admin.name} revoked an invite`);
+
+            track('editor_invite_revoked', { session: this.sessionKey, user: admin.userId });
 
             this.invitesChanged();
         });
@@ -2547,6 +2674,10 @@ export class ModelRoom extends Room {
             `[${this.roomId}] ${admin.name} invited ${sent.length} by email as ${role}` +
             (failed.length ? ` (${failed.length} failed)` : '')
         );
+
+        // Counts only: never the addresses
+        track('editor_invite_sent', { session: this.sessionKey, user: admin.userId, role,
+            sent: sent.length, failed: failed.length });
 
 
         // The admin may have left meanwhile
@@ -2758,8 +2889,14 @@ export class ModelRoom extends Room {
 
         this.broadcast('session:closed', { by: byUser.name });
 
+        track('editor_session_closed', { session: this.sessionKey, user: byUser.userId,
+            people_online: this.onlineUsers().length });
+
 
         for (const user of this.users.values()) {
+            if (user.online || user.dropped.size) {
+                this.trackLeft(user, 'closed');
+            }
             this.disconnectUser(user, LEAVE_CODES.CLOSED, 'The session was closed');
         }
     }
@@ -2844,7 +2981,7 @@ export class ModelRoom extends Room {
                     `You were inactive for ${IDLE_MINUTES} minutes`
                 );
 
-                this.afterUserGone(user);
+                this.afterUserGone(user, 'idle');
 
                 if (this.closed) {
                     return;
@@ -3026,7 +3163,7 @@ export class ModelRoom extends Room {
                 name,
                 description: cleanText(data?.description, MAX_VERSION_DESCRIPTION),
                 auto: false
-            }, user);
+            }, user, null, { kind: 'manual', vr: this.inVr(client) });
 
             if (!version) {
                 this.actionDenied(client, 'scene:save', this.saveError || 'Saving failed, please try again');
@@ -3054,6 +3191,65 @@ export class ModelRoom extends Room {
 
             if (reason) {
                 this.actionDenied(client, 'scene:restore', reason);
+            } else {
+                track('editor_scene_restored', { session: this.sessionKey, user: admin.userId, objects: this.objects.size });
+            }
+        });
+
+
+        /*
+         * What only the browser sees, for analytics (analytics.mjs):
+         *   { kind: 'vr_start' | 'vr_end' }           a VR headset session
+         *   { kind: 'ar_local' }                      AR on this device (no link)
+         *   { kind: 'export', format, scope, objects, meshes, lights, ok, bytes }
+         * Checked against fixed lists; anything else is ignored. At most
+         * USAGE_PER_MINUTE per person.
+         */
+        this.onApproved('analytics:usage', (client, user, data) => {
+
+            const now = Date.now();
+            user.usageTimes = (user.usageTimes || []).filter((t) => t > now - 60000);
+
+            if (user.usageTimes.length >= USAGE_PER_MINUTE) {
+                return;
+            }
+
+            user.usageTimes.push(now);
+
+            const kind = String(data?.kind || '');
+
+            if (kind === 'vr_start') {
+
+                if (!this.inVr(client)) {
+                    client.userData = { ...client.userData, vr: { at: now, moves: 0, scales: 0, adds: 0, removes: 0, materials: 0, renames: 0 } };
+                    track('editor_vr_started', { session: this.sessionKey, user: user.userId, role: user.role });
+                }
+
+            } else if (kind === 'vr_end') {
+
+                this.endVr(client, user);
+
+            } else if (kind === 'ar_local') {
+
+                track('editor_ar_local', { session: this.sessionKey, user: user.userId, role: user.role });
+
+            } else if (kind === 'export') {
+
+                const format = EXPORT_FORMATS.includes(data?.format) ? data.format : null;
+                const scope = EXPORT_SCOPES.includes(data?.scope) ? data.scope : null;
+
+                if (!format || !scope) {
+                    return;
+                }
+
+                const objects = boundedInt(data?.objects, 0, 100000);
+
+                track('editor_export', {
+                    session: this.sessionKey, user: user.userId, format, scope, objects,
+                    multi: objects > 1, meshes: data?.meshes !== false, lights: data?.lights === true,
+                    ok: data?.ok !== false, bytes: boundedInt(data?.bytes, 0, 4 * 1024 ** 3),
+                    vr: this.inVr(client) || undefined
+                });
             }
         });
     }
@@ -3084,7 +3280,7 @@ export class ModelRoom extends Room {
      * for autosaves. Returns the version summary, or null
      * (reason in this.saveError).
      */
-    async save(version, byUser, approved = null) {
+    async save(version, byUser, approved = null, how = null) {
 
         // Nothing to keep in a session that never had a model
         // (scene:save says so before getting here: EMPTY_SAVE_REASON)
@@ -3159,6 +3355,15 @@ export class ModelRoom extends Room {
                 this.sendApproved('scene:saved', { version: summary });
             }
 
+            track('editor_scene_saved', {
+                session: this.sessionKey,
+                user: byUser?.userId,
+                kind: how?.kind || saveKind(version, approved),
+                objects: summary.objectCount,
+                bytes: summary.bytes,
+                vr: (how?.vr || approved?.vr) || undefined
+            });
+
             await this.confirmInsertions(toConfirm);
 
             return summary;
@@ -3214,6 +3419,8 @@ export class ModelRoom extends Room {
 
         if (!admins.length) {
             console.log(`[${this.roomId}] save asked by ${user.name}: no admin online, not saved`);
+            track('editor_save_resolved', { session: this.sessionKey, user: user.userId, outcome: 'no_admin',
+                wait_s: 0, objects: this.objects.size, vr: this.inVr(client) || undefined });
             return client.send('save:status', {
                 requestId: null,
                 status: 'no-admin',
@@ -3229,8 +3436,13 @@ export class ModelRoom extends Room {
             revision: this.changeCount,
             objects: [...this.objects.values()].map((o) => structuredClone(o)),
             createdAt: Date.now(),
-            status: 'pending'
+            status: 'pending',
+            // Asked from a VR headset (analytics)
+            vr: this.inVr(client)
         };
+
+        track('editor_save_requested', { session: this.sessionKey, user: user.userId, request: request.id.slice(0, 12),
+            role: user.role, objects: request.objects.length, vr: request.vr || undefined });
 
         request.timer = setTimeout(() => this.resolveSave(request, 'expired', null,
             'No admin answered in time; nothing was saved. You can ask again.'), SAVE_REQUEST_MINUTES * 60000);
@@ -3293,6 +3505,12 @@ export class ModelRoom extends Room {
         if (request.status !== 'pending' && request.status !== 'saving') {
             return;
         }
+
+        track('editor_save_resolved', {
+            session: this.sessionKey, user: request.by.userId, request: request.id.slice(0, 12), outcome: status,
+            by: admin?.userId, wait_s: Math.round((Date.now() - request.createdAt) / 1000),
+            objects: request.objects?.length, vr: request.vr || undefined
+        });
 
         request.status = status;
         clearTimeout(request.timer);
@@ -3950,6 +4168,12 @@ export class ModelRoom extends Room {
             this.unconfirmed.set(insertionId, object.id);
             this.markDirty();
 
+            // Where BeeStoon says it came from: My 3D Library, a generation
+            // here, or a generation from an image of My Library
+            this.trackModelAdded(client, user, object, {
+                tool: IMPORT_ORIGINS.includes(reserved.origin) ? reserved.origin : 'beestoon'
+            }, { bytes: body.length, model: reserved.modelId, insertion: insertionId });
+
             console.log(`[${this.roomId}] BeeStoon model "${object.name}" added by ${user.name} (insertion ${insertionId.slice(0, 8)})`);
 
             // Everyone, the person who asked too
@@ -4028,7 +4252,7 @@ export class ModelRoom extends Room {
         console.log(`[${this.roomId}] editor access ended for "${user.name}"`);
 
         this.disconnectUser(user, ACCESS_REMOVED_CODE, reason);
-        this.afterUserGone(user);
+        this.afterUserGone(user, 'access');
 
         return true;
     }
@@ -4049,10 +4273,167 @@ export class ModelRoom extends Room {
 
         for (const client of clients) {
 
+            this.endVr(client, user);
+
             client.userData = { ...client.userData, noReconnect: true };
 
             client.leave(code, reason);
         }
+    }
+
+
+    // ==============================================
+    // ANALYTICS (analytics.mjs)
+    // ==============================================
+
+    // A new person in the session (not a second browser)
+    trackJoin(user, via, extra = {}) {
+
+        const a = this.analytics;
+
+        // Start of this stay (waiting, or approved), for its duration
+        user.analyticsSince = Date.now();
+
+        a.people.add(user.userId);
+        a.peak = Math.max(a.peak, [...this.users.values()].filter((u) => u.status === 'approved').length);
+
+        if (user.status === 'approved' && !a.started) {
+
+            a.started = true;
+
+            const choices = a.choices || (this.poolBacked ? {} : this.credits);
+
+            track('editor_session_started', {
+                session: this.sessionKey,
+                user: this.owner?.userId || user.userId,
+                kind: a.kind,
+                session_type: this.sessionType,
+                name: this.sessionName,
+                scene: sessionRef(this.sceneId),
+                pool_initial: this.poolBacked ? this.initialPool : this.credits.total,
+                pool_for_entry: typeof choices.forEntry === 'boolean' ? choices.forEntry : undefined,
+                pool_for_models: typeof choices.forModels === 'boolean' ? choices.forModels : undefined,
+                objects: this.objects.size
+            });
+        }
+
+        if (user.status === 'approved') {
+            track('editor_member_joined', { session: this.sessionKey, user: user.userId, role: user.role, via, ...extra });
+        } else {
+            track('editor_join_requested', { session: this.sessionKey, user: user.userId, removed_before: !!user.removedBefore || undefined });
+        }
+    }
+
+
+    // Someone has no browser left here
+    trackLeft(user, reason) {
+
+        const since = user.analyticsSince;
+
+        if (since == null) {
+            return;   // already counted as gone
+        }
+
+        user.analyticsSince = null;
+
+        track(user.status === 'approved' ? 'editor_member_left' : 'editor_join_abandoned', {
+            session: this.sessionKey,
+            user: user.userId,
+            role: user.status === 'approved' ? user.role : 'pending',
+            reason,
+            duration_s: Math.round((Date.now() - since) / 1000)
+        });
+    }
+
+
+    /*
+     * A model in the scene. origin = { tool, detail?, from?, op? }
+     * from the editor (which tool or import made it, the models it
+     * was made from, one id per tool use), or the import origin.
+     */
+    trackModelAdded(client, user, object, origin, extra = {}) {
+
+        this.countVr(client, 'adds');
+
+        track('editor_model_added', {
+            session: this.sessionKey,
+            user: user.userId,
+            object: object.id,
+            name: String(object.name || '').slice(0, 120),
+            asset: object.assetId ? object.assetId.slice(0, 16) : undefined,
+            origin: origin?.tool || 'unknown',
+            detail: origin?.detail,
+            from: origin?.from?.length ? origin.from : undefined,
+            op: origin?.op,
+            vr: this.inVr(client) || undefined,
+            ...extra
+        });
+    }
+
+
+    // One use of an edit tool on an object: repeated messages of one
+    // gesture (a drag sends many) count once
+    trackEdit(client, user, object, tool) {
+
+        const key = `${tool}:${object.id}:${user.userId}`;
+        const now = Date.now();
+        const last = this.analytics.edits.get(key);
+
+        this.analytics.edits.set(key, now);
+
+        if (last && now - last < EDIT_GESTURE_MS) {
+            return;
+        }
+
+        if (this.analytics.edits.size > 5000) {
+            for (const [k, t] of this.analytics.edits) {
+                if (now - t > EDIT_GESTURE_MS) {
+                    this.analytics.edits.delete(k);
+                }
+            }
+        }
+
+        track('editor_tool_used', { session: this.sessionKey, user: user.userId, tool, object: object.id,
+            vr: this.inVr(client) || undefined });
+    }
+
+
+    inVr(client) {
+
+        return !!client?.userData?.vr;
+    }
+
+
+    countVr(client, key) {
+
+        const vr = client?.userData?.vr;
+
+        if (vr) {
+            vr[key]++;
+        }
+    }
+
+
+    // The end of one browser's VR session, with what changed in it
+    endVr(client, user) {
+
+        const vr = client?.userData?.vr;
+
+        if (!vr) {
+            return;
+        }
+
+        client.userData = { ...client.userData, vr: null };
+
+        track('editor_vr_ended', {
+            session: this.sessionKey,
+            user: user?.userId || client.userData?.userId,
+            role: user?.role,
+            duration_s: Math.round((Date.now() - vr.at) / 1000),
+            moves: vr.moves, scales: vr.scales, adds: vr.adds, removes: vr.removes,
+            materials: vr.materials, renames: vr.renames,
+            changes: vr.moves + vr.adds + vr.removes + vr.materials + vr.renames
+        });
     }
 
 
@@ -4162,6 +4543,79 @@ function cleanSource(source) {
 function isValidId(value) {
 
     return typeof value === 'string' && ID_PATTERN.test(value);
+}
+
+
+/*
+ * What made a model (object:add's origin, from the editor):
+ *   { tool, detail?, from?: [object ids], op? }
+ * Only known tools, short safe strings and ids; an older client
+ * that sends none gives "unknown".
+ */
+function cleanOrigin(origin) {
+
+    if (!origin || typeof origin !== 'object' || !CLIENT_ORIGINS.includes(origin.tool)) {
+        return { tool: 'unknown' };
+    }
+
+    return {
+        tool: origin.tool,
+        detail: /^[A-Za-z0-9_-]{1,24}$/.test(String(origin.detail ?? '')) ? String(origin.detail).toLowerCase() : undefined,
+        from: Array.isArray(origin.from) ? origin.from.filter(isValidId).slice(0, 20) : undefined,
+        op: /^[A-Za-z0-9_-]{6,40}$/.test(String(origin.op ?? '')) ? origin.op : undefined
+    };
+}
+
+
+// A whole number in [min, max], else null
+function boundedInt(value, min, max) {
+
+    const n = Math.floor(Number(value));
+
+    return Number.isFinite(n) && n >= min && n <= max ? n : null;
+}
+
+
+// Did the size change between two poses?
+function scaleChanged(before, after) {
+
+    const a = before?.scale;
+    const b = after?.scale;
+
+    if (!Array.isArray(b)) {
+        return false;
+    }
+
+    if (!Array.isArray(a)) {
+        return b.some((v) => Math.abs(v - 1) > 1e-4);
+    }
+
+    return b.some((v, i) => Math.abs(v - a[i]) > 1e-4 * Math.max(1, Math.abs(a[i])));
+}
+
+
+// manual | approved | auto | end | insert | restore, for a save
+function saveKind(version, approved) {
+
+    const name = String(version?.name || '');
+
+    if (approved) {
+        return 'approved';
+    }
+
+    if (name === 'Before restore' || name.startsWith('Restored "')) {
+        return 'restore';
+    }
+
+    if (!version?.auto) {
+        return 'manual';
+    }
+
+    if (name === 'Session end') {
+        return 'end';
+    }
+
+    return name.startsWith('Added ') ? 'insert' : 'auto';
 }
 
 

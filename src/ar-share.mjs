@@ -62,6 +62,7 @@ import { pipeline } from 'node:stream/promises';
 
 import { getArStorage } from './ar-storage.mjs';
 import { requireMember } from './sessions.mjs';
+import { track } from './analytics.mjs';
 
 
 // Keep in sync with MAX_AR_SNAPSHOT_SIZE in the editor's ar-share.mjs
@@ -229,6 +230,17 @@ async function handleUpload(req, res, storage) {
 
     console.log(`[ar] snapshot ${id.slice(0, 6)}... session ${shortKey(sessionKey)} by ${shortKey(meta.createdBy)} (${(body.length / 1048576).toFixed(1)} MB, ${LINK_HOURS} h)`);
 
+    // Analytics: what the link shows, as the editor says (the selected
+    // objects or all the scene, and how many)
+    track('editor_ar_link_created', {
+        session: sessionKey,
+        user: meta.createdBy,
+        scope: ['selected', 'all'].includes(req.query.scope) ? req.query.scope : 'unknown',
+        objects: /^\d{1,5}$/.test(String(req.query.objects || '')) ? Number(req.query.objects) : undefined,
+        bytes: body.length,
+        hours: LINK_HOURS
+    });
+
     res.json({
         id,
         url: `${baseUrl(req)}/ar/${id}`,
@@ -259,6 +271,9 @@ async function handleViewer(req, res, storage) {
         res.status(410).send(expiredPage());
         return;
     }
+
+    // Someone opened the link (any phone, logged in or not: nobody is identified)
+    track('editor_ar_link_opened', { session: meta.sessionKey });
 
     res.send(viewerPage(meta));
 }
