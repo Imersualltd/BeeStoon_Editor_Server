@@ -259,3 +259,31 @@ node scripts/analytics-backfill.mjs --apply  # ارسال (اجرای دوبار
 ```
 
 تست: `node test/analytics.test.mjs`
+
+## ثبت خطا (Sentry)
+
+خطاهای سرور به Sentry می‌رود (سازمان `beestoon-ltd`، پروژهٔ `beestoon-editor-server`، داده در اتحادیهٔ اروپا،
+`de.sentry.io`). تنظیمات در `src/instrument.mjs` است که قبل از سرور بارگذاری می‌شود:
+`node --import ./src/instrument.mjs src/index.mjs` (در `npm start` و `Dockerfile`).
+
+| متغیر | توضیح |
+|---|---|
+| `SENTRY_DSN` | DSN پروژه. **بدون آن چیزی فرستاده نمی‌شود** (تست‌ها و اجرای محلی). |
+| `SENTRY_ENVIRONMENT` | پیش‌فرض: `production` با `NODE_ENV=production`، وگرنه `development` (با `EDITOR_DEPLOYMENT=development` هم `development`). |
+| `SENTRY_TRACES_SAMPLE_RATE` | سهم درخواست‌هایی که trace می‌شوند؛ پیش‌فرض ۰٫۱ در production و ۱ در بقیه. |
+| `SENTRY_RELEASE` | پیش‌فرض: `RENDER_GIT_COMMIT`. |
+
+- فرستاده می‌شود: خطاهای Express که هیچ مسیری جوابشان را نداده، استثناهای گرفته‌نشده و promiseهای
+  رد‌شدهٔ بدون catch، و نمونه‌ای از traceهای درخواست‌ها.
+- هیچ‌وقت فرستاده نمی‌شود:
+  - کاربر: id، ایمیل، IP و موقعیت. هر رویداد آدرس جایگزین `0.0.0.0` دارد، چون بدون آن Sentry از آدرس
+    فرستنده شهر را حدس می‌زند.
+  - کوکی، بدنهٔ درخواست، متغیرهای محلی، و هدرهای آدرس یا هویت (`X-Forwarded-For`، `X-Identity`، ...).
+  - خروجی console، حتی به شکل breadcrumb، چون لاگ‌ها نام افراد و کلید جلسه دارند.
+  - کلیدها در مسیرها (`/sessions/<key>`، `/internal/sessions/<key>`، `/assets/<sceneId>`، `/ar/<id>`)،
+    query string، ایمیل، و هر توکن تصادفی‌نمای ۲۰+ کاراکتری در متن‌ها، که همه با `[Filtered]` جایگزین می‌شوند.
+    شناسه‌های خود Sentry (`event_id`، `trace_id`) و stack trace دست نمی‌خورند.
+- خطاهای داخل پیام‌های اتاق Colyseus را خود Colyseus می‌گیرد و چاپ می‌کند، پس هنوز به Sentry نمی‌روند
+  (تغییری در رفتار اتاق داده نشد).
+
+تست: `node test/error-tracking.test.mjs` (قواعد، و سرور واقعی با یک Sentry ساختگی)

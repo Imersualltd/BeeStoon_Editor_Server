@@ -84,3 +84,7 @@ services:
         sync: false
       - key: SCENE_S3_PREFIX
         value: editor-scenes/
+      # Error tracking (Sentry, src/instrument.mjs): the DSN of the
+      # beestoon-editor-server project. Unset: nothing is sent
+      - key: SENTRY_DSN
+        sync: false

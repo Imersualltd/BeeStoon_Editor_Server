@@ -13,4 +13,5 @@ RUN npm install --omit=dev
 COPY src ./src
 ENV NODE_ENV=production
 EXPOSE 2567
-CMD ["node", "src/index.mjs"]
+# instrument.mjs first: error tracking (Sentry, off without SENTRY_DSN)
+CMD ["node", "--import", "./src/instrument.mjs", "src/index.mjs"]

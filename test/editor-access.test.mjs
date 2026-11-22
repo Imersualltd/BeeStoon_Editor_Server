@@ -207,6 +207,8 @@ async function members(userId) {
 async function main() {
 
     await waitFor(() => serverLog.includes('listening'), 'server start', 15000);
+    // Printed right after "listening": wait for it rather than race it
+    await waitFor(() => serverLog.includes('Editor access:'), 'access line', 5000);
 
     check('the server says how access is checked', () => {
         assert.match(serverLog, /Editor access: BeeStoon account tick, rechecked every 1s/);
