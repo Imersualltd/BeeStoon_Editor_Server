@@ -84,6 +84,34 @@
  *     'save:decline'      { requestId }  (admins)
  *     'scene:versions'    {}  -> 'scene:versions' { versions }
  *
+ *   Changes made in VR (vr-editor.mjs): back on the desktop the
+ *   person who was in VR confirms the changes to objects assigned
+ *   to them; every other VR change is for an admin to confirm.
+ *     'vr:review'         { changes: [{ key, objectId, name, moved,
+ *                         rotated, scaled, deleted }], ops: [{ key,
+ *                         tool, name, pieces, after: [opKey] }] },
+ *                         every row also { mine } (assigned to them)
+ *     'vr:review-update'  { requestId, keep } (requester: what they
+ *                         kept of their own rows; admins get the
+ *                         request again with row.userKeep filled)
+ *                         (editors; at most VR_REVIEW_MAX rows each)
+ *                         -> requester 'vr:review-status' { requestId,
+ *                         status: pending | approved | left | failed,
+ *                         text, waiting }, admins 'vr:review-request'
+ *                         { requestId, by, changes, ops }. Stays open
+ *                         while the requester is in the session; an
+ *                         admin who joins later gets it too.
+ *     'vr:review-answer'  { requestId, keep: { changes: { key: { moved,
+ *                         rotated, scaled, deleted } }, ops: { key: bool } } }
+ *                         (admins; the first answer counts, also for
+ *                         rows marked mine, i.e. assigned to the
+ *                         requester, which the requester confirms
+ *                         first: the admin always sees every row and
+ *                         has the last word) ->
+ *                         requester 'vr:review-result' { requestId, by,
+ *                         keep }; their editor puts back what was not
+ *                         kept. Admins: 'vr:review-resolved'.
+ *
  *   Saved sessions (scene-versions.mjs): the first save
  *   makes the session a saved session owned by its
  *   creator. Autosave every AUTOSAVE_MINUTES while
@@ -260,6 +288,12 @@ const SAVE_COOLDOWN_SECONDS = 3;
 
 // A save asked for by a non-admin waits this long for an admin
 const SAVE_REQUEST_MINUTES = 10;
+
+// Removed models whose assignment is remembered (Undo, cut pieces)
+const REMOVED_ASSIGNEES_MAX = 5000;
+
+// Rows in one VR review (changes, and tool uses, each)
+const VR_REVIEW_MAX = 300;
 
 const EMPTY_SAVE_REASON =
     'Nothing to save yet: add a model first. An empty session is not kept as a saved session.';
@@ -1471,6 +1505,8 @@ export class ModelRoom extends Room {
 
         this.releaseHoldsOf(user.userId);
 
+        this.dropVrReviewsOf(user);
+
 
         // The last admin is gone: admin goes to the oldest
         // editor. With no editor the session stays as it is: an
@@ -1670,7 +1706,7 @@ export class ModelRoom extends Room {
                     : null,
                 materials: previous && previous.assetId === data.assetId ? previous.materials || {} : {},
                 addedBy: previous ? previous.addedBy : user.userId,
-                assignedTo: previous ? previous.assignedTo : null,
+                assignedTo: previous ? previous.assignedTo : this.inheritedAssignee(data.id, data.origin),
                 heldBy: previous ? previous.heldBy : null,
                 overrideBy: previous ? previous.overrideBy || null : null
             };
@@ -1929,6 +1965,8 @@ export class ModelRoom extends Room {
 
 
             this.objects.delete(object.id);
+
+            this.rememberAssignee(object);
 
             if (object.dataUrl) {
                 this.totalBytes -= object.dataUrl.length;
@@ -2431,6 +2469,11 @@ export class ModelRoom extends Room {
 
 
             console.log(`[${this.roomId}] ${admin.name} made "${user.name}" ${user.role}`);
+
+            // A new admin sees the requests still waiting for one
+            if (fromRole !== 'admin' && user.role === 'admin' && user.online) {
+                this.sendSaveRequests(user);
+            }
 
 
             this.sendState();
@@ -3175,6 +3218,12 @@ export class ModelRoom extends Room {
         this.onAdmin('save:approve', (client, admin, data) => this.answerSave(client, admin, data?.requestId, true));
         this.onAdmin('save:decline', (client, admin, data) => this.answerSave(client, admin, data?.requestId, false));
 
+        // Changes made in VR to objects not assigned to the person
+        // who made them: an admin keeps or puts back each one
+        this.onApproved('vr:review', (client, user, data) => this.requestVrReview(client, user, data));
+        this.onApproved('vr:review-update', (client, user, data) => this.updateVrReview(client, user, data));
+        this.onAdmin('vr:review-answer', (client, admin, data) => this.answerVrReview(client, admin, data));
+
         // Version list: everyone who is in
         this.onApproved('scene:versions', (client) => {
 
@@ -3537,6 +3586,12 @@ export class ModelRoom extends Room {
         for (const request of this.saveRequests?.values() || []) {
             if (request.status === 'pending') {
                 this.sendToUser(user, 'save:request', this.saveRequestView(request));
+            }
+        }
+
+        for (const request of this.vrReviews?.values() || []) {
+            if (request.status === 'pending') {
+                this.sendToUser(user, 'vr:review-request', this.vrReviewView(request));
             }
         }
     }
@@ -4480,6 +4535,259 @@ export class ModelRoom extends Room {
     }
 
 
+    /*
+     * Assignments survive the tools that replace models: a cut
+     * (Knife, Slicer, Separate, Magic Knife), Sculpt or Combine
+     * removes the model and adds new ones whose origin.from names
+     * it. The new ones are assigned to whoever the removed ones
+     * were assigned to (all to the same person, else nobody). A
+     * removed model added back under its own id (Undo) gets its
+     * assignment back. Only people who are still editors or
+     * admins of the session are assigned.
+     */
+    rememberAssignee(object) {
+
+        this.removedAssignees = this.removedAssignees || new Map();
+
+        this.removedAssignees.delete(object.id);
+        this.removedAssignees.set(object.id, object.assignedTo || null);
+
+        // Oldest first: keep the last REMOVED_ASSIGNEES_MAX
+        while (this.removedAssignees.size > REMOVED_ASSIGNEES_MAX) {
+            this.removedAssignees.delete(this.removedAssignees.keys().next().value);
+        }
+    }
+
+
+    inheritedAssignee(id, origin) {
+
+        const removed = this.removedAssignees || new Map();
+
+        let assignee = null;
+
+        if (removed.has(id)) {
+
+            assignee = removed.get(id);
+
+        } else {
+
+            const from = cleanOrigin(origin)?.from || [];
+            const known = from.filter((fromId) => removed.has(fromId));
+
+            if (known.length && known.length === from.length) {
+                const people = new Set(known.map((fromId) => removed.get(fromId)));
+                assignee = people.size === 1 ? [...people][0] : null;
+            }
+        }
+
+        const user = assignee ? this.users.get(assignee) : null;
+
+        return user && user.status === 'approved' && (user.role === 'editor' || user.role === 'admin')
+            ? assignee
+            : null;
+    }
+
+
+    /*
+     * VR review (see the top of the file). The room only passes
+     * the list on: the changes are already in the scene, and the
+     * requester's editor puts back what the admin did not keep
+     * (it holds the originals of cut and sculpted models).
+     */
+    requestVrReview(client, user, data) {
+
+        if (user.role !== 'editor') {
+            return client.send('vr:review-status', {
+                requestId: null,
+                status: 'failed',
+                text: user.role === 'admin' ? 'Admins confirm their own VR changes' : 'Viewers cannot change objects'
+            });
+        }
+
+        const changes = cleanVrRows(data?.changes, (row) => ({
+            key: cleanKey(row.key),
+            objectId: typeof row.objectId === 'string' ? row.objectId.slice(0, 200) : null,
+            name: cleanVrName(row.name),
+            moved: row.moved === true,
+            rotated: row.rotated === true,
+            scaled: row.scaled === true,
+            deleted: row.deleted === true,
+            mine: row.mine === true,
+            userKeep: null
+        })).filter((row) => row.moved || row.rotated || row.scaled || row.deleted);
+
+        const ops = cleanVrRows(data?.ops, (row) => ({
+            key: cleanKey(row.key),
+            tool: ['magic', 'slicer', 'sculpt'].includes(row.tool) ? row.tool : 'other',
+            name: cleanVrName(row.name),
+            pieces: Number.isInteger(row.pieces) && row.pieces >= 0 ? Math.min(row.pieces, 9999) : 0,
+            after: Array.isArray(row.after) ? row.after.slice(0, VR_REVIEW_MAX).map(cleanKey).filter(Boolean) : [],
+            mine: row.mine === true,
+            userKeep: null
+        }));
+
+        if (!changes.length && !ops.length) {
+            return client.send('vr:review-status', { requestId: null, status: 'failed', text: 'No VR changes to confirm' });
+        }
+
+        this.vrReviews = this.vrReviews || new Map();
+
+        const request = {
+            id: randomUUID(),
+            by: { userId: user.userId, name: user.name },
+            changes,
+            ops,
+            createdAt: Date.now(),
+            status: 'pending'
+        };
+
+        this.vrReviews.set(request.id, request);
+
+        const admins = this.onlineUsers('admin');
+
+        console.log(`[${this.roomId}] ${user.name} asks an admin to confirm ${changes.length + ops.length} VR change(s) ` +
+            `(request ${request.id.slice(0, 8)}, ${admins.length} admin(s) online)`);
+
+        for (const admin of admins) {
+            this.sendToUser(admin, 'vr:review-request', this.vrReviewView(request));
+        }
+
+        this.sendToUser(user, 'vr:review-status', {
+            requestId: request.id,
+            status: 'pending',
+            waiting: !admins.length,
+            text: admins.length
+                ? 'Waiting for a session admin to confirm your VR changes'
+                : 'No session admin is online yet. Your VR changes stay as they are until an admin confirms them.'
+        });
+    }
+
+
+    // The requester decided the rows assigned to them: the admins
+    // see what was kept (and can still override it)
+    updateVrReview(client, user, data) {
+
+        const request = this.vrReviews?.get(String(data?.requestId || ''));
+
+        if (!request || request.status !== 'pending' || request.by.userId !== user.userId) {
+            return;
+        }
+
+        const keepChanges = data?.keep?.changes && typeof data.keep.changes === 'object' ? data.keep.changes : {};
+        const keepOps = data?.keep?.ops && typeof data.keep.ops === 'object' ? data.keep.ops : {};
+
+        for (const row of request.changes) {
+            const k = keepChanges[row.key];
+            if (row.mine && k && typeof k === 'object') {
+                row.userKeep = {
+                    moved: row.moved && k.moved === true,
+                    rotated: row.rotated && k.rotated === true,
+                    scaled: row.scaled && k.scaled === true,
+                    deleted: row.deleted && k.deleted === true
+                };
+            }
+        }
+
+        for (const row of request.ops) {
+            if (row.mine && Object.prototype.hasOwnProperty.call(keepOps, row.key)) {
+                row.userKeep = keepOps[row.key] === true;
+            }
+        }
+
+        for (const admin of this.onlineUsers('admin')) {
+            this.sendToUser(admin, 'vr:review-request', this.vrReviewView(request));
+        }
+    }
+
+
+    vrReviewView(request) {
+
+        return {
+            requestId: request.id,
+            by: request.by,
+            changes: request.changes,
+            ops: request.ops,
+            createdAt: request.createdAt
+        };
+    }
+
+
+    // The first admin's answer counts; later ones only hear the result
+    answerVrReview(client, admin, data) {
+
+        const request = this.vrReviews?.get(String(data?.requestId || ''));
+
+        if (!request || request.status !== 'pending') {
+            return client.send('vr:review-resolved', { requestId: data?.requestId ?? null, status: request?.status || 'unknown' });
+        }
+
+        const keepChanges = data?.keep?.changes && typeof data.keep.changes === 'object' ? data.keep.changes : {};
+        const keepOps = data?.keep?.ops && typeof data.keep.ops === 'object' ? data.keep.ops : {};
+
+        // Only the rows asked about; anything missing goes back
+        const keep = {
+            changes: Object.fromEntries(request.changes.map((row) => {
+                const k = keepChanges[row.key] || {};
+                return [row.key, {
+                    moved: row.moved && k.moved === true,
+                    rotated: row.rotated && k.rotated === true,
+                    scaled: row.scaled && k.scaled === true,
+                    deleted: row.deleted && k.deleted === true
+                }];
+            })),
+            ops: Object.fromEntries(request.ops.map((row) => [row.key, keepOps[row.key] === true]))
+        };
+
+        const kept = Object.values(keep.changes).filter((k) => k.moved || k.rotated || k.scaled || k.deleted).length +
+            Object.values(keep.ops).filter(Boolean).length;
+
+        console.log(`[${this.roomId}] ${admin.name} answered the VR review of ${request.by.name} ` +
+            `(request ${request.id.slice(0, 8)}): ${kept} of ${request.changes.length + request.ops.length} kept`);
+
+        const requester = this.users.get(request.by.userId);
+
+        if (requester) {
+            this.sendToUser(requester, 'vr:review-result', {
+                requestId: request.id,
+                by: { userId: admin.userId, name: admin.name },
+                keep
+            });
+        }
+
+        this.resolveVrReview(request, 'approved', admin);
+    }
+
+
+    resolveVrReview(request, status, admin) {
+
+        if (request.status !== 'pending') {
+            return;
+        }
+
+        request.status = status;
+        request.changes = null;
+        request.ops = null;
+
+        for (const user of this.onlineUsers('admin')) {
+            this.sendToUser(user, 'vr:review-resolved', { requestId: request.id, status, by: admin?.name || null });
+        }
+
+        // Kept a while for late answers, then dropped
+        setTimeout(() => this.vrReviews?.delete(request.id), 10 * 60000).unref?.();
+    }
+
+
+    // The requester left: nobody can put their changes back any more
+    dropVrReviewsOf(user) {
+
+        for (const request of this.vrReviews?.values() || []) {
+            if (request.status === 'pending' && request.by.userId === user.userId) {
+                this.resolveVrReview(request, 'left', null);
+            }
+        }
+    }
+
+
     noteActivity(user) {
 
         user.lastActive = Date.now();
@@ -4525,6 +4833,35 @@ export class ModelRoom extends Room {
 // ==================================================
 // VALIDATION
 // ==================================================
+
+// VR review rows: an array of plain objects, at most VR_REVIEW_MAX,
+// each made clean by `clean`; rows without a key are left out
+function cleanVrRows(rows, clean) {
+
+    if (!Array.isArray(rows)) {
+        return [];
+    }
+
+    const seen = new Set();
+
+    return rows.slice(0, VR_REVIEW_MAX)
+        .filter((row) => row && typeof row === 'object')
+        .map(clean)
+        .filter((row) => row.key && !seen.has(row.key) && seen.add(row.key));
+}
+
+
+function cleanKey(key) {
+
+    return (typeof key === 'string' || typeof key === 'number') ? String(key).slice(0, 40) : '';
+}
+
+
+function cleanVrName(name) {
+
+    return typeof name === 'string' ? name.replace(/[\u0000-\u001f]/g, '').slice(0, 200) : '';
+}
+
 
 function cleanSource(source) {
 
