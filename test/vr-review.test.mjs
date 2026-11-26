@@ -309,6 +309,56 @@ async function main() {
     await waitFor(() => ada.got('vr:review-resolved', (r) => r.status === 'left'), 'cara left');
     check('the request closes when the requester leaves', () => {});
 
+    console.log('\nPieces of a cut stay assigned (VR or not)');
+
+    const DATA = 'data:model/gltf-binary;base64,AAAA';
+    const add = (u, id, origin) => u.send('object:add', { id, name: `${id}.glb`, dataUrl: DATA, transform: pose(0), origin });
+
+    ada.send('role:set', { userId: 'dev:bob', role: 'editor' });
+    await waitFor(() => bob.state.you.role === 'editor', 'bob editor again');
+
+    add(ada, 'table');
+    add(ada, 'lamp');
+    await waitFor(() => objectIn(bob, 'table') && objectIn(bob, 'lamp'), 'table and lamp');
+    ada.send('object:assign', { id: 'table', userId: 'dev:bob' });
+    await waitFor(() => objectIn(bob, 'table')?.assignedTo === 'dev:bob', 'table assigned');
+
+    // Slicer / Knife: the original goes, two pieces come
+    bob.send('object:remove', { id: 'table' });
+    add(bob, 'table_a', { tool: 'knife', from: ['table'], op: 'op-cut000001' });
+    add(bob, 'table_b', { tool: 'knife', from: ['table'], op: 'op-cut000001' });
+    await waitFor(() => objectIn(ada, 'table_a') && objectIn(ada, 'table_b'), 'pieces');
+    check('both pieces of a cut stay assigned to the editor', () => {
+        assert.equal(objectIn(ada, 'table_a').assignedTo, 'dev:bob');
+        assert.equal(objectIn(ada, 'table_b').assignedTo, 'dev:bob');
+        assert.equal(objectIn(ada, 'lamp').assignedTo, null);
+    });
+
+    // A piece cut again
+    bob.send('object:remove', { id: 'table_a' });
+    add(bob, 'table_a1', { tool: 'magic', from: ['table_a'], op: 'op-cut000002' });
+    await waitFor(() => objectIn(ada, 'table_a1'), 'piece of a piece');
+    check('... and pieces of those pieces', () => assert.equal(objectIn(ada, 'table_a1').assignedTo, 'dev:bob'));
+
+    // Undo: the pieces go, the original comes back under its id
+    bob.send('object:remove', { id: 'table_a1' });
+    bob.send('object:remove', { id: 'table_b' });
+    add(bob, 'table', { tool: 'undo' });
+    await waitFor(() => objectIn(ada, 'table') && !objectIn(ada, 'table_b'), 'undo');
+    check('Undo brings the original back still assigned', () => assert.equal(objectIn(ada, 'table').assignedTo, 'dev:bob'));
+
+    // Combine of an assigned and a free model: nobody
+    bob.send('object:remove', { id: 'table' });
+    bob.send('object:remove', { id: 'lamp' });
+    add(bob, 'combo', { tool: 'combine', from: ['table', 'lamp'], op: 'op-comb00001' });
+    await waitFor(() => objectIn(ada, 'combo'), 'combo');
+    check('a model made from differently assigned ones is not assigned', () => assert.equal(objectIn(ada, 'combo').assignedTo, null));
+
+    // A model added for the first time stays unassigned
+    add(bob, 'fresh');
+    await waitFor(() => objectIn(ada, 'fresh'), 'fresh');
+    check('a new model is not assigned', () => assert.equal(objectIn(ada, 'fresh').assignedTo, null));
+
     ada.room.leave();
     bob.room.leave();
 

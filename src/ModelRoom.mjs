@@ -289,6 +289,9 @@ const SAVE_COOLDOWN_SECONDS = 3;
 // A save asked for by a non-admin waits this long for an admin
 const SAVE_REQUEST_MINUTES = 10;
 
+// Removed models whose assignment is remembered (Undo, cut pieces)
+const REMOVED_ASSIGNEES_MAX = 5000;
+
 // Rows in one VR review (changes, and tool uses, each)
 const VR_REVIEW_MAX = 300;
 
@@ -1703,7 +1706,7 @@ export class ModelRoom extends Room {
                     : null,
                 materials: previous && previous.assetId === data.assetId ? previous.materials || {} : {},
                 addedBy: previous ? previous.addedBy : user.userId,
-                assignedTo: previous ? previous.assignedTo : null,
+                assignedTo: previous ? previous.assignedTo : this.inheritedAssignee(data.id, data.origin),
                 heldBy: previous ? previous.heldBy : null,
                 overrideBy: previous ? previous.overrideBy || null : null
             };
@@ -1962,6 +1965,8 @@ export class ModelRoom extends Room {
 
 
             this.objects.delete(object.id);
+
+            this.rememberAssignee(object);
 
             if (object.dataUrl) {
                 this.totalBytes -= object.dataUrl.length;
@@ -4527,6 +4532,59 @@ export class ModelRoom extends Room {
         }
 
         return list;
+    }
+
+
+    /*
+     * Assignments survive the tools that replace models: a cut
+     * (Knife, Slicer, Separate, Magic Knife), Sculpt or Combine
+     * removes the model and adds new ones whose origin.from names
+     * it. The new ones are assigned to whoever the removed ones
+     * were assigned to (all to the same person, else nobody). A
+     * removed model added back under its own id (Undo) gets its
+     * assignment back. Only people who are still editors or
+     * admins of the session are assigned.
+     */
+    rememberAssignee(object) {
+
+        this.removedAssignees = this.removedAssignees || new Map();
+
+        this.removedAssignees.delete(object.id);
+        this.removedAssignees.set(object.id, object.assignedTo || null);
+
+        // Oldest first: keep the last REMOVED_ASSIGNEES_MAX
+        while (this.removedAssignees.size > REMOVED_ASSIGNEES_MAX) {
+            this.removedAssignees.delete(this.removedAssignees.keys().next().value);
+        }
+    }
+
+
+    inheritedAssignee(id, origin) {
+
+        const removed = this.removedAssignees || new Map();
+
+        let assignee = null;
+
+        if (removed.has(id)) {
+
+            assignee = removed.get(id);
+
+        } else {
+
+            const from = cleanOrigin(origin)?.from || [];
+            const known = from.filter((fromId) => removed.has(fromId));
+
+            if (known.length && known.length === from.length) {
+                const people = new Set(known.map((fromId) => removed.get(fromId)));
+                assignee = people.size === 1 ? [...people][0] : null;
+            }
+        }
+
+        const user = assignee ? this.users.get(assignee) : null;
+
+        return user && user.status === 'approved' && (user.role === 'editor' || user.role === 'admin')
+            ? assignee
+            : null;
     }
 
 
